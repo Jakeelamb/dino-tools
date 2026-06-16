@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stable:
+    name: stable crate surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable components
+        run: rustup component add rustfmt clippy
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.87.0 --profile minimal
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check declared MSRV
+        run: cargo +1.87.0 check --locked --lib --bins
+
+      - name: Clippy default library
+        run: cargo clippy --lib -- -D warnings
+
+      - name: Check library warnings
+        run: RUSTFLAGS="-D warnings" cargo check --lib
+
+      - name: Check rustdoc warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+      - name: Test default library
+        run: cargo test --lib
+
+      - name: Check stable all-feature lib and bins
+        run: cargo check --lib --bins --all-features
+
+      - name: Check libdeflate feature composition
+        run: |
+          cargo check --no-default-features --features libdeflate --lib --bins
+          cargo check --no-default-features --features gzip,libdeflate --lib --bins
+
+      - name: Check release documentation artifacts
+        run: |
+          test -s CITATION.cff
+          test -s CHANGELOG.md
+          test -s CONTRIBUTING.md
+          test -s SECURITY.md
+          test -s docs/API_SURFACE.md
+          test -s docs/FRAMEWORK.md
+          test -s docs/PUBLISHING.md
+          test -s docs/RELEASE_AUDIT.md
+
+      - name: Check benchmark script syntax
+        run: |
+          bash -n scripts/benchmark-gauntlet.sh
+          bash -n scripts/benchmark-common.sh
+          bash -n scripts/render-benchmark-report.sh
+          bash -n scripts/benchmark-rust-peers.sh
+          bash -n scripts/benchmark-rust-peer-size-sweep.sh
+          bash -n scripts/benchmark-fasta-peers.sh
+          bash -n scripts/benchmark-fasta-peer-size-sweep.sh
+          bash -n scripts/benchmark-fasta-gauntlet.sh
+          bash -n scripts/check-replication-host.sh
+          bash -n scripts/check-fuzz-corpus.sh
+          bash -n scripts/check-benchmark-snapshots.sh
+          bash -n scripts/discover-local-benchmark-corpus.sh
+          bash -n scripts/export-replication-kit.sh
+          bash -n scripts/prepare-real-benchmark-inputs.sh
+          bash -n scripts/release-gate.sh
+
+      - name: Shellcheck benchmark and release scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --external-sources --severity=warning scripts/*.sh
+
+      - name: Check dependency policy
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
+          (cd fuzz && cargo deny check)
+
+      - name: Verify checked benchmark snapshots
+        run: scripts/check-benchmark-snapshots.sh
+
+      - name: Package dry run
+        run: cargo package
+
+  nightly:
+    name: nightly all-feature surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+
+      - name: Clippy all features
+        run: cargo +nightly clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy no default features
+        run: cargo +nightly clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Test all features
+        run: cargo +nightly test --all-features
+
+      - name: Test no default features
+        run: cargo +nightly test --no-default-features
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Compile fuzz targets
+        run: cargo +nightly fuzz build
+
+      - name: Run fuzz corpus smoke tests
+        run: scripts/check-fuzz-corpus.sh

@@ -83,6 +83,24 @@ impl ToolDescriptor {
     }
 
     #[must_use]
+    pub const fn workspace(
+        name: &'static str,
+        role: &'static str,
+        crate_name: &'static str,
+        command: &'static str,
+        suite_contracts: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            role,
+            status: ToolStatus::Workspace,
+            source: ToolSource::WorkspaceCrate { crate_name },
+            command: Some(command),
+            suite_contracts,
+        }
+    }
+
+    #[must_use]
     pub const fn planned(name: &'static str, role: &'static str) -> Self {
         Self {
             name,
@@ -105,12 +123,11 @@ pub const TOOL_REGISTRY: &[ToolDescriptor] = &[
         "trex",
         &["read ingest boundary", "assembly pipeline caller"],
     ),
-    ToolDescriptor::external(
-        "microraptor",
+    ToolDescriptor::workspace(
+        "dino-seq",
         "FASTQ/FASTA parsing and ingest",
-        "/home/jake/Projects/microraptor",
-        "https://github.com/Jakeelamb/microraptor",
-        "microraptor",
+        "dino-seq",
+        "dino-seq",
         &[
             "raw/gzip/BGZF FASTQ opener",
             "raw/gzip/BGZF FASTA opener",
@@ -137,14 +154,14 @@ mod tests {
     use super::{find_tool, ToolSource, ToolStatus, TOOL_REGISTRY};
 
     #[test]
-    fn registry_tracks_existing_tools_as_external() {
+    fn registry_tracks_trex_as_external_and_dino_seq_as_workspace() {
         assert_eq!(
             find_tool("trex").map(|tool| tool.status),
             Some(ToolStatus::External)
         );
         assert_eq!(
-            find_tool("microraptor").map(|tool| tool.status),
-            Some(ToolStatus::External)
+            find_tool("dino-seq").map(|tool| tool.status),
+            Some(ToolStatus::Workspace)
         );
     }
 
@@ -158,18 +175,17 @@ mod tests {
     }
 
     #[test]
-    fn microraptor_records_external_contracts() {
-        let tool = find_tool("microraptor");
+    fn dino_seq_records_workspace_contracts() {
+        let tool = find_tool("dino-seq");
 
         assert_eq!(
             tool.map(|descriptor| descriptor.command),
-            Some(Some("microraptor"))
+            Some(Some("dino-seq"))
         );
         assert_eq!(
             tool.map(|descriptor| descriptor.source),
-            Some(ToolSource::ExternalRepo {
-                local_path: "/home/jake/Projects/microraptor",
-                repository: "https://github.com/Jakeelamb/microraptor",
+            Some(ToolSource::WorkspaceCrate {
+                crate_name: "dino-seq",
             })
         );
         assert_eq!(

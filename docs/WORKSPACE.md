@@ -30,9 +30,8 @@ External tools can be organized here before they are promoted. Start by adding
 their source location, command name, and suite-facing contracts to `dino-core`,
 then add a focused page under `docs/tools/`.
 
-This is the current pattern for Microraptor: Dino Tools documents its
-FASTQ/FASTA ingest contract and local source repo, but does not import the crate
-or dispatch to the standalone command yet.
+This is the current pattern for Dino Seq: the FASTQ/FASTA ingest implementation
+lives in `crates/dino-seq`, and `dino dino-seq` reports workspace metadata.
 
 ## Readiness Gates
 
@@ -43,6 +42,7 @@ cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p dino-cli -- list
+cargo run -p dino-cli -- dino-seq
 ```
 
 `dino-core` and `dino-io` should also pass `cargo package --allow-dirty` when

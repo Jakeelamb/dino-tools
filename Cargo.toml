@@ -3,6 +3,7 @@ members = [
     "crates/dino-cli",
     "crates/dino-core",
     "crates/dino-io",
+    "crates/dino-seq",
 ]
 resolver = "2"
 
@@ -11,7 +12,7 @@ authors = ["Jake Lamb"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Jakeelamb/dino-tools"
-rust-version = "1.76"
+rust-version = "1.87"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

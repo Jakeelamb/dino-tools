@@ -52,7 +52,7 @@ fn print_help() {
     println!("  dino status");
     println!("  dino <tool>");
     println!();
-    println!("Existing tools stay standalone until explicitly promoted.");
+    println!("Promoted tools run from workspace crates; external tools stay standalone.");
 }
 
 fn print_tools() {

@@ -12,6 +12,7 @@ Use the `dino-*` prefix for suite-owned shared crates:
 
 - `dino-core`
 - `dino-io`
+- `dino-seq`
 - `dino-kmers`
 - `dino-graph`
 - `dino-align`
@@ -25,7 +26,7 @@ job instead of a temporary implementation detail.
 | Tool | Intended Role | Current Status |
 | --- | --- | --- |
 | `trex` | assembler / heavy de novo engine | external |
-| `microraptor` | FASTQ/FASTA parsing and ingest | external |
+| `dino-seq` | FASTQ/FASTA parsing and ingest | workspace |
 | `velociraptor` | fast search, sketching, and prefiltering | planned |
 | `ankylosaurus` | QC, validation, and defensive filtering | planned |
 | `stegosaurus` | graph layout and scaffolding | planned |
@@ -41,7 +42,8 @@ Prefer:
 dino list
 dino status
 dino trex assemble ...
-dino microraptor stats ...
+dino-seq stats ...
+dino dino-seq
 ```
 
 The last two forms are future promotion targets. Until a tool is promoted, keep

@@ -1,0 +1,40 @@
+[package]
+name = "dino-seq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dino-seq = { path = ".." }
+
+[[bin]]
+name = "fastq_reader"
+path = "fuzz_targets/fastq_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack"
+path = "fuzz_targets/pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fasta_reader"
+path = "fuzz_targets/fasta_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bgzf_roundtrip"
+path = "fuzz_targets/bgzf_roundtrip.rs"
+test = false
+doc = false
+bench = false

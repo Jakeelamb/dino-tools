@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/dino-cli",
+    "crates/dino-core",
+    "crates/dino-io",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Jake Lamb"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Jakeelamb/dino-tools"
+rust-version = "1.76"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

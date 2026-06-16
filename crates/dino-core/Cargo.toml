@@ -1,0 +1,16 @@
+[package]
+name = "dino-core"
+version = "0.1.0"
+description = "Shared registry and suite metadata for Dino Tools bioinformatics tools"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,16 @@
+[package]
+name = "dino-io"
+version = "0.1.0"
+description = "Lightweight shared sequence IO helpers for Dino Tools"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"

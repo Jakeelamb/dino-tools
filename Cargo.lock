@@ -34,21 +34,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dino-cli"
-version = "0.1.0"
-dependencies = [
- "dino-core",
-]
-
-[[package]]
-name = "dino-core"
-version = "0.1.0"
-
-[[package]]
-name = "dino-io"
-version = "0.1.0"
-
-[[package]]
 name = "dino-seq"
 version = "0.1.0"
 dependencies = [
@@ -58,6 +43,10 @@ dependencies = [
  "memchr",
  "memmap2",
 ]
+
+[[package]]
+name = "dna"
+version = "0.1.2"
 
 [[package]]
 name = "find-msvc-tools"

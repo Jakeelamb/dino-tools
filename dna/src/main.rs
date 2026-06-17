@@ -221,6 +221,16 @@ enum Palette {
     Mono,
 }
 
+#[derive(Clone, Copy)]
+struct FrameConfig {
+    mode: AppMode,
+    seed: u64,
+    speed: f32,
+    scale: f32,
+    focus: bool,
+    palette: Palette,
+}
+
 impl Palette {
     fn next(self) -> Self {
         match self {
@@ -484,7 +494,17 @@ fn run_interactive(initial_mode: AppMode) -> io::Result<()> {
             }
         }
 
-        let frame = state.draw(&mut out, mode, seed, speed, scale, focus, palette)?;
+        let frame = state.draw(
+            &mut out,
+            FrameConfig {
+                mode,
+                seed,
+                speed,
+                scale,
+                focus,
+                palette,
+            },
+        )?;
         out.flush()?;
         sleep_frame(start, scaled_frame(frame, speed));
     }
@@ -511,28 +531,19 @@ impl RenderState {
         }
     }
 
-    fn draw(
-        &mut self,
-        out: &mut impl Write,
-        mode: AppMode,
-        seed: u64,
-        speed: f32,
-        scale: f32,
-        focus: bool,
-        palette: Palette,
-    ) -> io::Result<Duration> {
+    fn draw(&mut self, out: &mut impl Write, config: FrameConfig) -> io::Result<Duration> {
         match self {
             Self::Matrix(state) => {
-                state.draw(out, mode, seed, speed, scale, focus, palette)?;
+                state.draw(out, config)?;
                 Ok(Duration::from_millis(45))
             }
             Self::Helix(state) => {
-                state.draw(out, mode, seed, speed, scale, focus, palette)?;
+                state.draw(out, config)?;
                 Ok(Duration::from_millis(33))
             }
             #[cfg(feature = "codon-wheel")]
             Self::Codon(state) => {
-                state.draw(out, seed, speed, scale, focus, palette)?;
+                state.draw(out, config)?;
                 Ok(Duration::from_millis(320))
             }
         }
@@ -559,33 +570,24 @@ impl MatrixState {
         }
     }
 
-    fn draw(
-        &mut self,
-        out: &mut impl Write,
-        mode: AppMode,
-        seed: u64,
-        speed: f32,
-        scale: f32,
-        focus: bool,
-        palette: Palette,
-    ) -> io::Result<()> {
-        let alphabet = mode.alphabet();
+    fn draw(&mut self, out: &mut impl Write, config: FrameConfig) -> io::Result<()> {
+        let alphabet = config.mode.alphabet();
         let size = terminal_size();
         if size != (self.width, self.height) {
             (self.width, self.height) = size;
             self.columns = Columns::new(self.width as usize, self.height as i32, &mut self.rng);
         }
 
-        let column_step = if scale >= 1.8 {
+        let column_step = if config.scale >= 1.8 {
             3
-        } else if scale >= 1.25 {
+        } else if config.scale >= 1.25 {
             2
         } else {
             1
         };
 
-        if speed == 0.0 {
-            return status_line(out, self.height, mode, seed, speed, scale, focus, palette);
+        if config.speed == 0.0 {
+            return status_line(out, self.height, config);
         }
 
         write!(out, "\x1b[2J")?;
@@ -597,14 +599,14 @@ impl MatrixState {
                     continue;
                 }
                 let base = alphabet[self.rng.range(4) as usize];
-                let shade = if matches!(palette, Palette::Bases) {
-                    palette.base(base)
+                let shade = if matches!(config.palette, Palette::Bases) {
+                    config.palette.base(base)
                 } else if i == 0 {
-                    palette.matrix(0)
+                    config.palette.matrix(0)
                 } else if i < 4 {
-                    palette.matrix(1)
+                    config.palette.matrix(1)
                 } else {
-                    palette.matrix(2)
+                    config.palette.matrix(2)
                 };
                 write!(out, "\x1b[{y};{}H{shade}{}", x + 1, base as char)?;
             }
@@ -613,7 +615,7 @@ impl MatrixState {
                 col.reset(self.height as i32, &mut self.rng);
             }
         }
-        status_line(out, self.height, mode, seed, speed, scale, focus, palette)
+        status_line(out, self.height, config)
     }
 }
 
@@ -633,21 +635,12 @@ impl HelixState {
         }
     }
 
-    fn draw(
-        &mut self,
-        out: &mut impl Write,
-        mode: AppMode,
-        seed: u64,
-        speed: f32,
-        scale: f32,
-        focus: bool,
-        palette: Palette,
-    ) -> io::Result<()> {
-        let alphabet = mode.alphabet();
+    fn draw(&mut self, out: &mut impl Write, config: FrameConfig) -> io::Result<()> {
+        let alphabet = config.mode.alphabet();
         let (width, height) = terminal_size();
         let mid_x = (width / 2).max(1) as i32;
         let rows = height.saturating_sub(2).max(1) as i32;
-        let amp = (((width as f32) * 0.22) * scale).clamp(4.0, 48.0);
+        let amp = (((width as f32) * 0.22) * config.scale).clamp(4.0, 48.0);
 
         clear(out)?;
         for y in 1..=rows {
@@ -669,10 +662,10 @@ impl HelixState {
                 y,
                 back_x,
                 back_base as char,
-                if matches!(palette, Palette::Bases) {
-                    palette.base(back_base)
+                if matches!(config.palette, Palette::Bases) {
+                    config.palette.base(back_base)
                 } else {
-                    palette.back()
+                    config.palette.back()
                 },
             )?;
             draw_base(
@@ -680,18 +673,18 @@ impl HelixState {
                 y,
                 front_x,
                 front_base as char,
-                if matches!(palette, Palette::Bases) {
-                    palette.base(front_base)
+                if matches!(config.palette, Palette::Bases) {
+                    config.palette.base(front_base)
                 } else {
-                    palette.front()
+                    config.palette.front()
                 },
             )?;
         }
-        if speed > 0.0 {
-            self.theta += 0.16 * speed;
-            self.tick = self.tick.wrapping_add(speed.ceil() as usize);
+        if config.speed > 0.0 {
+            self.theta += 0.16 * config.speed;
+            self.tick = self.tick.wrapping_add(config.speed.ceil() as usize);
         }
-        status_line(out, height, mode, seed, speed, scale, focus, palette)
+        status_line(out, height, config)
     }
 }
 
@@ -710,19 +703,11 @@ impl CodonState {
         }
     }
 
-    fn draw(
-        &mut self,
-        out: &mut impl Write,
-        seed: u64,
-        speed: f32,
-        scale: f32,
-        focus: bool,
-        palette: Palette,
-    ) -> io::Result<()> {
+    fn draw(&mut self, out: &mut impl Write, config: FrameConfig) -> io::Result<()> {
         let (width, height) = terminal_size();
         let center_x = (width / 2).max(1) as i32;
         let center_y = (height / 2).max(1) as i32;
-        let radius = (((width.min(height * 2) as f32) * 0.24) * scale).clamp(3.0, 28.0);
+        let radius = (((width.min(height * 2) as f32) * 0.24) * config.scale).clamp(3.0, 28.0);
         let active = self.tick % 64;
 
         clear(out)?;
@@ -744,12 +729,12 @@ impl CodonState {
                 radius * 0.38,
                 spoke_angle,
                 RNA[first] as char,
-                if matches!(palette, Palette::Bases) && is_active {
-                    palette.active_base(RNA[first])
-                } else if matches!(palette, Palette::Bases) {
-                    palette.base(RNA[first])
+                if matches!(config.palette, Palette::Bases) && is_active {
+                    config.palette.active_base(RNA[first])
+                } else if matches!(config.palette, Palette::Bases) {
+                    config.palette.base(RNA[first])
                 } else {
-                    palette.codon(0, is_active)
+                    config.palette.codon(0, is_active)
                 },
             )?;
             draw_polar(
@@ -759,12 +744,12 @@ impl CodonState {
                 radius * 0.56,
                 angle,
                 RNA[second] as char,
-                if matches!(palette, Palette::Bases) && is_active {
-                    palette.active_base(RNA[second])
-                } else if matches!(palette, Palette::Bases) {
-                    palette.base(RNA[second])
+                if matches!(config.palette, Palette::Bases) && is_active {
+                    config.palette.active_base(RNA[second])
+                } else if matches!(config.palette, Palette::Bases) {
+                    config.palette.base(RNA[second])
                 } else {
-                    palette.codon(1, is_active)
+                    config.palette.codon(1, is_active)
                 },
             )?;
             draw_polar(
@@ -774,12 +759,12 @@ impl CodonState {
                 radius,
                 angle,
                 RNA[third] as char,
-                if matches!(palette, Palette::Bases) && is_active {
-                    palette.active_base(RNA[third])
-                } else if matches!(palette, Palette::Bases) {
-                    palette.base(RNA[third])
+                if matches!(config.palette, Palette::Bases) && is_active {
+                    config.palette.active_base(RNA[third])
+                } else if matches!(config.palette, Palette::Bases) {
+                    config.palette.base(RNA[third])
                 } else {
-                    palette.codon(2, is_active)
+                    config.palette.codon(2, is_active)
                 },
             )?;
 
@@ -791,7 +776,7 @@ impl CodonState {
                     radius + 5.0,
                     angle,
                     '*',
-                    palette.accent(),
+                    config.palette.accent(),
                 )?;
                 write!(
                     out,
@@ -805,44 +790,26 @@ impl CodonState {
             }
         }
 
-        if speed > 0.0 {
-            self.theta += 0.045 * speed;
-            self.tick = self.tick.wrapping_add(speed.ceil() as usize);
+        if config.speed > 0.0 {
+            self.theta += 0.045 * config.speed;
+            self.tick = self.tick.wrapping_add(config.speed.ceil() as usize);
         }
-        status_line(
-            out,
-            height,
-            AppMode::Codon,
-            seed,
-            speed,
-            scale,
-            focus,
-            palette,
-        )
+        status_line(out, height, config)
     }
 }
 
-fn status_line(
-    out: &mut impl Write,
-    height: u16,
-    mode: AppMode,
-    seed: u64,
-    speed: f32,
-    scale: f32,
-    focus: bool,
-    palette: Palette,
-) -> io::Result<()> {
-    if focus {
+fn status_line(out: &mut impl Write, height: u16, config: FrameConfig) -> io::Result<()> {
+    if config.focus {
         return Ok(());
     }
     write!(
         out,
         "\x1b[{height};2H\x1b[90m{} | seed {} | speed {:.2}x | scale {:.2}x | color {} | left/right mode | up/down speed | +/- scale | c color | f focus | q exits\x1b[0m",
-        mode.label(),
-        seed,
-        speed,
-        scale,
-        palette.label()
+        config.mode.label(),
+        config.seed,
+        config.speed,
+        config.scale,
+        config.palette.label()
     )
 }
 

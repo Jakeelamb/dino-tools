@@ -7,6 +7,9 @@ use std::time::Duration;
 /// Target frame interval for helix mode in `main.rs` (`RenderState::draw` → helix branch).
 const HELIX_FRAME_MS: f32 = 33.0;
 
+pub type HelixCell = Option<(char, u8, u8, u8)>;
+pub type HelixGrid = Vec<Vec<HelixCell>>;
+
 #[allow(dead_code)]
 const DNA: &[u8; 4] = b"ATCG";
 const DNA_CODONS: &[&[u8; 3]] = &[
@@ -108,14 +111,13 @@ impl HelixMini {
         let frame_sec = (HELIX_FRAME_MS / 1000.0) / speed.max(0.01);
         let num_frames = elapsed_sec / frame_sec;
         self.theta += 0.16 * speed * num_frames;
-        let tick_step = (speed.ceil() as f32 * num_frames).floor() as usize;
+        let tick_step = (speed.ceil() * num_frames).floor() as usize;
         self.tick = self.tick.wrapping_add(tick_step);
     }
 
     /// `grid[y][x]` = optional (base char, rgb). Unoccupied cells are `None`.
-    pub fn render_grid(&self, width: usize, height: usize, scale: f32) -> Vec<Vec<Option<(char, u8, u8, u8)>>> {
-        let mut grid: Vec<Vec<Option<(char, u8, u8, u8)>>> =
-            vec![vec![None; width]; height];
+    pub fn render_grid(&self, width: usize, height: usize, scale: f32) -> HelixGrid {
+        let mut grid: HelixGrid = vec![vec![None; width]; height];
         if width == 0 || height == 0 {
             return grid;
         }

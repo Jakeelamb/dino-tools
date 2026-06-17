@@ -1,42 +1,33 @@
 # Dino Tools
 
-Dino Tools is the umbrella workspace for a Rust-first bioinformatics tool suite.
+Dino Tools is a small workspace for standalone Rust tools.
 
-The suite command is `dino`. Individual tools such as `trex` remain independent
-repositories until they are stable enough to promote into the suite.
+There is no umbrella `dino` command. Each tool owns its own package, binary,
+README, tests, and release surface. The root workspace exists only so local
+development can build and test the checked-in tools together.
 
 ## Current Shape
 
-- `crates/dino-cli`: umbrella command and discovery surface.
-- `crates/dino-core`: shared suite metadata and tool registry types.
-- `crates/dino-io`: shared lightweight bioinformatics IO helpers.
 - `crates/dino-seq`: FASTQ/FASTA streaming parser and ingest CLI.
-- `docs/`: naming, workspace, and promotion rules.
-- `CHANGELOG.md`: reviewable history for workspace-level changes.
-
-## Organized Tools
-
-- `dna/`: nucleotide terminal animations (`DNA` CLI). Standalone Rust crate;
-  see [dna/README.md](dna/README.md).
-
-- `dino-seq`: workspace ingest/parser for FASTQ/FASTA streaming. See
-  [docs/tools/dino-seq.md](docs/tools/dino-seq.md) and
-  [crates/dino-seq/README.md](crates/dino-seq/README.md).
+- `dna/`: nucleotide terminal animations (`DNA` CLI).
+- `CHANGELOG.md`: reviewable history for workspace-level changes only.
 
 ## Near-Term Rule
 
-Do not merge existing tools into this workspace by default. Develop each tool in
-its own repository, then promote only stable shared contracts into `dino-core` or
-`dino-io`.
+Keep tools isolated unless shared code proves it is worth extracting. Prefer a
+little duplication over a framework layer that couples unrelated tools.
+
+## Install
+
+```sh
+cargo install --path crates/dino-seq
+cargo install --path dna
+```
 
 ## Commands
 
 ```sh
-cargo run -p dino-cli -- list
-cargo run -p dino-cli -- status
-cargo run -p dino-cli -- dino-seq
 cargo run -p dino-seq -- stats --help
+cargo run -p dna --bin DNA -- --help
 cargo test --workspace
 ```
-
-For the full local readiness gate, see [docs/WORKSPACE.md](docs/WORKSPACE.md).

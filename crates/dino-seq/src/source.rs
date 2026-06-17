@@ -580,6 +580,53 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "libdeflate")]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct StreamStats {
+        records: u64,
+        bases: u64,
+        qualities: u64,
+        name_bytes: u64,
+        checksum: u64,
+    }
+
+    #[cfg(feature = "libdeflate")]
+    impl StreamStats {
+        fn observe_record(&mut self, name: &[u8], seq: &[u8], qual: &[u8]) {
+            self.records += 1;
+            self.bases += seq.len() as u64;
+            self.qualities += qual.len() as u64;
+            self.name_bytes += name.len() as u64;
+            self.checksum = self
+                .checksum
+                .wrapping_add(seq.first().copied().unwrap_or_default() as u64)
+                .wrapping_mul(1_099_511_628_211)
+                .wrapping_add(seq.len() as u64);
+        }
+    }
+
+    #[cfg(feature = "libdeflate")]
+    fn consume_fastq<R: Read>(reader: &mut FastqReader<R>) -> Result<StreamStats> {
+        let mut stats = StreamStats::default();
+        while let Some(batch) = reader.next_batch()? {
+            for record in batch.records() {
+                stats.observe_record(record.name(), record.seq(), record.qual());
+            }
+        }
+        Ok(stats)
+    }
+
+    #[cfg(feature = "libdeflate")]
+    fn consume_fasta<R: Read>(reader: &mut FastaReader<R>) -> Result<StreamStats> {
+        let mut stats = StreamStats::default();
+        while let Some(batch) = reader.next_batch()? {
+            for record in batch.records() {
+                stats.observe_record(record.name(), record.seq(), b"");
+            }
+        }
+        Ok(stats)
+    }
+
     #[cfg(all(feature = "gzip", feature = "libdeflate"))]
     fn gzip_member(payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -727,9 +774,9 @@ mod tests {
         )
         .unwrap();
 
-        let auto_stats = crate::benchutil::consume_fastq(&mut auto).unwrap();
-        let flate2_stats = crate::benchutil::consume_fastq(&mut flate2).unwrap();
-        let libdeflate_stats = crate::benchutil::consume_fastq(&mut libdeflate).unwrap();
+        let auto_stats = consume_fastq(&mut auto).unwrap();
+        let flate2_stats = consume_fastq(&mut flate2).unwrap();
+        let libdeflate_stats = consume_fastq(&mut libdeflate).unwrap();
 
         assert_eq!(auto_stats, flate2_stats);
         assert_eq!(auto_stats, libdeflate_stats);
@@ -755,8 +802,8 @@ mod tests {
         let mut flate2 = open_fastq(&path).unwrap();
         let mut libdeflate = open_fastq_gzip_libdeflate(&path).unwrap();
 
-        let flate2_stats = crate::benchutil::consume_fastq(&mut flate2).unwrap();
-        let libdeflate_stats = crate::benchutil::consume_fastq(&mut libdeflate).unwrap();
+        let flate2_stats = consume_fastq(&mut flate2).unwrap();
+        let libdeflate_stats = consume_fastq(&mut libdeflate).unwrap();
         assert_eq!(flate2_stats, libdeflate_stats);
 
         std::fs::remove_file(path).unwrap();
@@ -775,7 +822,7 @@ mod tests {
         std::fs::write(&path, encoded).unwrap();
 
         let mut default_reader = open_fastq(&path).unwrap();
-        let default_stats = crate::benchutil::consume_fastq(&mut default_reader).unwrap();
+        let default_stats = consume_fastq(&mut default_reader).unwrap();
         assert_eq!(default_stats.records, 2);
 
         let err = match open_fastq_gzip_libdeflate(&path) {
@@ -855,8 +902,8 @@ mod tests {
         let mut flate2 = open_fasta(&path).unwrap();
         let mut libdeflate = open_fasta_gzip_libdeflate(&path).unwrap();
 
-        let flate2_stats = crate::benchutil::consume_fasta(&mut flate2).unwrap();
-        let libdeflate_stats = crate::benchutil::consume_fasta(&mut libdeflate).unwrap();
+        let flate2_stats = consume_fasta(&mut flate2).unwrap();
+        let libdeflate_stats = consume_fasta(&mut libdeflate).unwrap();
         assert_eq!(flate2_stats, libdeflate_stats);
 
         std::fs::remove_file(path).unwrap();
@@ -875,7 +922,7 @@ mod tests {
         std::fs::write(&path, encoded).unwrap();
 
         let mut default_reader = open_fasta(&path).unwrap();
-        let default_stats = crate::benchutil::consume_fasta(&mut default_reader).unwrap();
+        let default_stats = consume_fasta(&mut default_reader).unwrap();
         assert_eq!(default_stats.records, 2);
 
         let err = match open_fasta_gzip_libdeflate(&path) {

@@ -94,8 +94,6 @@
 //! # Ok::<(), dino_seq::FastqError>(())
 //! ```
 
-#[doc(hidden)]
-pub mod benchutil;
 #[cfg(feature = "bgzf")]
 mod bgzf;
 mod error;
@@ -137,9 +135,10 @@ pub use fasta::{
     visit_two_line_fasta_bytes, visit_two_line_fasta_read,
 };
 pub use fastq::{
-    FastqBatch, FastqConfig, FastqPair, FastqReader, FastqRecord, FastqVisitRecord,
-    InterleavedPairs, PairValidation, PairedFastqBatch, PairedFastqPairs, PairedFastqReader,
-    PairedRecords, PairingMode, RecordRef, paired_records, strip_pair_suffix, visit_fastq_bytes,
+    FastqBatch, FastqChunkConfig, FastqChunkSinkExt, FastqChunkStats, FastqConfig, FastqPair,
+    FastqReader, FastqRecord, FastqRecordSink, FastqVisitRecord, InterleavedPairs, PairValidation,
+    PairedFastqBatch, PairedFastqPairs, PairedFastqReader, PairedRecords, PairingMode, RecordRef,
+    paired_records, strip_pair_suffix, visit_fastq_bytes,
 };
 #[cfg(feature = "mmap")]
 pub use mmap::{count_fasta_mmap, visit_fasta_mmap, visit_fastq_mmap};

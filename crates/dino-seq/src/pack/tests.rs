@@ -294,13 +294,13 @@ fn trusted_fastq_exposes_packed_buffers_to_sink() {
 }
 
 #[test]
-fn trusted_direct_fastq_matches_offset_scan() {
+fn trusted_default_fastq_matches_direct_scan() {
     let input = b"@r0\r\nACGTN\r\n+\r\nIIIII\r\n@r1\nTGCA\n+\n!!!!\n";
-    let mut offset = Vec::new();
+    let mut default = Vec::new();
     let mut direct = Vec::new();
 
     pack_trusted_fastq(input, |record| {
-        offset.push((
+        default.push((
             record.name.to_vec(),
             record.bases.to_vec(),
             record.n_mask.to_vec(),
@@ -321,7 +321,7 @@ fn trusted_direct_fastq_matches_offset_scan() {
     })
     .unwrap();
 
-    assert_eq!(direct, offset);
+    assert_eq!(direct, default);
 }
 
 #[test]

@@ -1,5 +1,3 @@
-use std::ops::Range;
-
 use crate::error::{FastqError, FastqPosition, Result};
 
 #[derive(Clone, Copy)]
@@ -12,11 +10,6 @@ impl Line<'_> {
     #[inline]
     pub(crate) fn len(self) -> usize {
         self.bytes.len()
-    }
-
-    #[inline]
-    pub(crate) fn range(self) -> Range<usize> {
-        self.start..self.start + self.bytes.len()
     }
 }
 
@@ -34,9 +27,6 @@ pub(crate) struct RecordValidation {
 }
 
 impl RecordValidation {
-    pub(crate) const DEFAULT: Self = Self {
-        require_nonempty_id: true,
-    };
     pub(crate) const TRUSTED_PACK: Self = Self {
         require_nonempty_id: false,
     };
@@ -113,28 +103,6 @@ pub(crate) fn record_lines<'a>(
     }
 }
 
-pub(crate) fn direct_line<'a>(bytes: &'a [u8], cursor: &mut usize, eof: bool) -> Option<Line<'a>> {
-    let start = *cursor;
-    if start >= bytes.len() {
-        return None;
-    }
-
-    let mut end = start;
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    if end == bytes.len() && !eof {
-        return None;
-    }
-
-    *cursor = if end < bytes.len() { end + 1 } else { end };
-    let end = trim_cr_end(bytes, start, end);
-    Some(Line {
-        bytes: &bytes[start..end],
-        start,
-    })
-}
-
 pub(crate) fn validate_record(
     record: RecordLines<'_>,
     base_offset: u64,
@@ -150,16 +118,19 @@ pub(crate) fn validate_record(
             0,
         ));
     }
-    if validation.require_nonempty_id
-        && (record.name.len() == 1 || fastq_id_token(record.name.bytes).is_empty())
-    {
-        return Err(format_at(
-            "empty FASTQ id",
-            base_offset,
-            record.name.start,
-            record_index,
-            0,
-        ));
+    if validation.require_nonempty_id {
+        match record.name.bytes.get(1) {
+            Some(byte) if !byte.is_ascii_whitespace() => {}
+            _ => {
+                return Err(format_at(
+                    "empty FASTQ id",
+                    base_offset,
+                    record.name.start,
+                    record_index,
+                    0,
+                ));
+            }
+        }
     }
     if record.plus.bytes.first() != Some(&b'+') {
         return Err(format_at(
@@ -182,15 +153,6 @@ pub(crate) fn validate_record(
         ));
     }
     Ok(())
-}
-
-fn fastq_id_token(name: &[u8]) -> &[u8] {
-    let name = name.strip_prefix(b"@").unwrap_or(name);
-    let end = name
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(name.len());
-    &name[..end]
 }
 
 pub(crate) fn fast_slash_pair_ids_match(first_name: &[u8], second_name: &[u8]) -> Option<bool> {

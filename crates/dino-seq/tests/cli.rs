@@ -20,7 +20,6 @@ fn write_file(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
-
 fn dino_seq_bin() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_dino_seq") {
         return PathBuf::from(path);
@@ -33,10 +32,7 @@ fn dino_seq_bin() -> PathBuf {
 }
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(dino_seq_bin())
-        .args(args)
-        .output()
-        .unwrap()
+    Command::new(dino_seq_bin()).args(args).output().unwrap()
 }
 
 fn stdout(output: std::process::Output) -> String {

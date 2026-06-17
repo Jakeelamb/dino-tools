@@ -5,14 +5,14 @@ preserve correctness, reproducibility, and honest benchmark boundaries.
 
 ## Development Checks
 
-Run focused checks while editing, then run the release gate before publishing:
+Run focused checks while editing:
 
 ```bash
 cargo fmt --all -- --check
 RUSTFLAGS="-D warnings" cargo check --lib
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo test --all
-cargo package --allow-dirty
+cargo package --allow-dirty --list
 ```
 
 Use nightly only for explicitly nightly surfaces:
@@ -30,8 +30,7 @@ same commit. A useful benchmark contribution records:
 - exact command lines and environment variables;
 - hardware, OS, Rust toolchain, and feature flags;
 - comparator versions;
-- raw JSONL or TSV output;
-- generated Markdown/SVG figures from repository scripts;
+- raw output from the benchmark tool used;
 - checksum, record-count, or base-count parity where relevant.
 
 Machine-local benchmark artifacts are evidence, not universal claims. Keep

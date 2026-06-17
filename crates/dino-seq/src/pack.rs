@@ -7,14 +7,15 @@
 
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 use std::arch::x86_64::{
-    __m256i, _mm256_add_epi64, _mm256_cmpgt_epi8, _mm256_loadu_si256, _mm256_max_epu8,
-    _mm256_min_epu8, _mm256_movemask_epi8, _mm256_or_si256, _mm256_sad_epu8, _mm256_set1_epi8,
-    _mm256_setzero_si256, _mm256_storeu_si256, _mm256_sub_epi8,
+    __m128i, __m256i, _mm_cvtsi128_si32, _mm_max_epu8, _mm_min_epu8, _mm_srli_si128,
+    _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cmpgt_epi8, _mm256_extracti128_si256,
+    _mm256_loadu_si256, _mm256_max_epu8, _mm256_min_epu8, _mm256_movemask_epi8, _mm256_or_si256,
+    _mm256_sad_epu8, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_storeu_si256, _mm256_sub_epi8,
 };
 use std::fmt;
 use std::io::Read;
 
-use crate::fastq_frame::{self, RecordLines, RecordValidation};
+use crate::fastq_frame::{self, Line, RecordLines, RecordValidation};
 use crate::scan::scan_newlines;
 use crate::{FastqConfig, FastqError, Result as FastqResult};
 
@@ -313,24 +314,8 @@ pub fn pack_trusted_fastq(
 }
 
 /// Pack all complete records from an in-memory trusted FASTQ buffer into a sink.
-pub fn pack_trusted_fastq_sink(input: &[u8], mut sink: impl TrustedPackSink) -> FastqResult<()> {
-    let mut bases = Vec::new();
-    let mut n_mask = Vec::new();
-    let mut newlines = Vec::with_capacity(input.len() / 48);
-    let slab = pack_trusted_fastq_slab(
-        input,
-        SlabContext {
-            base_offset: 0,
-            first_record_index: 0,
-            eof: true,
-        },
-        &mut newlines,
-        &mut bases,
-        &mut n_mask,
-        &mut sink,
-    )?;
-    debug_assert_eq!(slab.next_start, input.len());
-    Ok(())
+pub fn pack_trusted_fastq_sink(input: &[u8], sink: impl TrustedPackSink) -> FastqResult<()> {
+    pack_trusted_fastq_direct_sink(input, sink)
 }
 
 /// Stream trusted four-line FASTQ from a reader and invoke a callback per record.
@@ -348,18 +333,10 @@ pub fn pack_trusted_fastq_read_sink<R: Read>(
     config: FastqConfig,
     mut sink: impl TrustedPackSink,
 ) -> FastqResult<()> {
-    pack_trusted_fastq_read_sink_with_kernel(
-        &mut reader,
-        config,
-        &mut sink,
-        TrustedScanKernel::Offset,
-    )
+    pack_trusted_fastq_read_direct_sink_impl(&mut reader, config, &mut sink)
 }
 
 /// Pack an in-memory trusted FASTQ buffer with the direct scanner.
-///
-/// This is a lower-level alternative used for benchmark and implementation
-/// comparison against the default newline-offset scanner.
 pub fn pack_trusted_fastq_direct(
     input: &[u8],
     on_record: impl FnMut(TrustedPackedRecord<'_>) -> FastqResult<()>,
@@ -400,25 +377,19 @@ pub fn pack_trusted_fastq_read_direct<R: Read>(
 
 /// Stream trusted FASTQ from a reader using the direct scanner into a sink.
 pub fn pack_trusted_fastq_read_direct_sink<R: Read>(
-    mut reader: R,
+    reader: R,
     config: FastqConfig,
     mut sink: impl TrustedPackSink,
 ) -> FastqResult<()> {
-    pack_trusted_fastq_read_sink_with_kernel(
-        &mut reader,
-        config,
-        &mut sink,
-        TrustedScanKernel::Direct,
-    )
+    pack_trusted_fastq_read_direct_sink_impl(reader, config, &mut sink)
 }
 
-fn pack_trusted_fastq_read_sink_with_kernel<R: Read>(
+fn pack_trusted_fastq_read_direct_sink_impl<R: Read>(
     reader: R,
     config: FastqConfig,
     sink: &mut impl TrustedPackSink,
-    kernel: TrustedScanKernel,
 ) -> FastqResult<()> {
-    let mut reader = TrustedFastqPackReader::new(reader, config, kernel);
+    let mut reader = TrustedFastqPackReader::new(reader, config);
     while reader.next_slab(sink)? {}
     Ok(())
 }
@@ -431,14 +402,12 @@ struct TrustedFastqPackReader<R> {
     eof: bool,
     base_offset: u64,
     record_index: u64,
-    newlines: Vec<usize>,
     bases: Vec<u8>,
     n_mask: Vec<u8>,
-    kernel: TrustedScanKernel,
 }
 
 impl<R: Read> TrustedFastqPackReader<R> {
-    fn new(reader: R, config: FastqConfig, kernel: TrustedScanKernel) -> Self {
+    fn new(reader: R, config: FastqConfig) -> Self {
         let slab_size = config.slab_size.max(1024);
         Self {
             reader,
@@ -448,10 +417,8 @@ impl<R: Read> TrustedFastqPackReader<R> {
             eof: false,
             base_offset: 0,
             record_index: 0,
-            newlines: Vec::with_capacity(slab_size / 48),
             bases: Vec::new(),
             n_mask: Vec::new(),
-            kernel,
         }
     }
 
@@ -474,23 +441,13 @@ impl<R: Read> TrustedFastqPackReader<R> {
             first_record_index: self.record_index,
             eof: self.eof,
         };
-        let slab = match self.kernel {
-            TrustedScanKernel::Offset => pack_trusted_fastq_slab(
-                &self.buf[..self.len],
-                context,
-                &mut self.newlines,
-                &mut self.bases,
-                &mut self.n_mask,
-                sink,
-            )?,
-            TrustedScanKernel::Direct => pack_trusted_fastq_direct_slab(
-                &self.buf[..self.len],
-                context,
-                &mut self.bases,
-                &mut self.n_mask,
-                sink,
-            )?,
-        };
+        let slab = pack_trusted_fastq_direct_slab(
+            &self.buf[..self.len],
+            context,
+            &mut self.bases,
+            &mut self.n_mask,
+            sink,
+        )?;
         if slab.records != 0 {
             sink.slab(TrustedPackSlab {
                 records: slab.records,
@@ -524,12 +481,6 @@ impl<R: Read> TrustedFastqPackReader<R> {
 
         Ok(true)
     }
-}
-
-#[derive(Clone, Copy)]
-enum TrustedScanKernel {
-    Offset,
-    Direct,
 }
 
 /// Stream ordered R1/R2 FASTQ inputs and emit trusted packed pairs.
@@ -1043,21 +994,53 @@ unsafe fn finish_avx2_quality_vectors(
         return;
     }
 
-    let mut min_lanes = [0_u8; 32];
-    let mut max_lanes = [0_u8; 32];
     let mut sum_lanes = [0_u64; 4];
     unsafe {
-        _mm256_storeu_si256(min_lanes.as_mut_ptr().cast::<__m256i>(), min_phred);
-        _mm256_storeu_si256(max_lanes.as_mut_ptr().cast::<__m256i>(), max_phred);
         _mm256_storeu_si256(sum_lanes.as_mut_ptr().cast::<__m256i>(), sum_phred);
     }
-    for &phred in &min_lanes {
-        summary.min_phred = summary.min_phred.min(phred);
-    }
-    for &phred in &max_lanes {
-        summary.max_phred = summary.max_phred.max(phred);
-    }
+    summary.min_phred = summary
+        .min_phred
+        .min(unsafe { horizontal_min_u8_256(min_phred) });
+    summary.max_phred = summary
+        .max_phred
+        .max(unsafe { horizontal_max_u8_256(max_phred) });
     summary.sum_phred = sum_lanes.iter().copied().sum();
+}
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_min_u8_256(value: __m256i) -> u8 {
+    let low = _mm256_castsi256_si128(value);
+    let high = _mm256_extracti128_si256(value, 1);
+    unsafe { horizontal_min_u8_128(_mm_min_epu8(low, high)) }
+}
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_max_u8_256(value: __m256i) -> u8 {
+    let low = _mm256_castsi256_si128(value);
+    let high = _mm256_extracti128_si256(value, 1);
+    unsafe { horizontal_max_u8_128(_mm_max_epu8(low, high)) }
+}
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_min_u8_128(mut value: __m128i) -> u8 {
+    value = _mm_min_epu8(value, _mm_srli_si128(value, 8));
+    value = _mm_min_epu8(value, _mm_srli_si128(value, 4));
+    value = _mm_min_epu8(value, _mm_srli_si128(value, 2));
+    value = _mm_min_epu8(value, _mm_srli_si128(value, 1));
+    _mm_cvtsi128_si32(value) as u8
+}
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_max_u8_128(mut value: __m128i) -> u8 {
+    value = _mm_max_epu8(value, _mm_srli_si128(value, 8));
+    value = _mm_max_epu8(value, _mm_srli_si128(value, 4));
+    value = _mm_max_epu8(value, _mm_srli_si128(value, 2));
+    value = _mm_max_epu8(value, _mm_srli_si128(value, 1));
+    _mm_cvtsi128_si32(value) as u8
 }
 
 /// Bin Phred+33 qualities into threshold indexes.
@@ -1108,64 +1091,6 @@ pub fn bin_qualities_into_slice(
     Ok(summary)
 }
 
-fn pack_trusted_fastq_slab(
-    input: &[u8],
-    context: SlabContext,
-    newlines: &mut Vec<usize>,
-    bases: &mut Vec<u8>,
-    n_mask: &mut Vec<u8>,
-    sink: &mut impl TrustedPackSink,
-) -> FastqResult<SlabResult> {
-    scan_newlines(input, newlines);
-    let mut records = 0_u64;
-
-    let layout = fastq_frame::slab_line_layout(input, newlines, context.eof);
-    if context.eof && !layout.line_count.is_multiple_of(4) {
-        let record_index = context.first_record_index + (layout.line_count / 4) as u64;
-        return Err(fastq_frame::format_at(
-            "truncated FASTQ record",
-            context.base_offset,
-            fastq_frame::line_start(newlines, (layout.line_count / 4) * 4),
-            record_index,
-            (layout.line_count % 4) as u8,
-        ));
-    }
-
-    for line in (0..layout.complete_lines).step_by(4) {
-        let record_index = context.first_record_index + (line / 4) as u64;
-        let record = fastq_frame::record_lines(input, newlines, line);
-
-        observe_trusted_packed_record(
-            record,
-            context.base_offset,
-            record_index,
-            bases,
-            n_mask,
-            sink,
-        )?;
-        records += 1;
-    }
-
-    if layout.complete_lines == layout.line_count && context.eof {
-        Ok(SlabResult {
-            next_start: input.len(),
-            records,
-        })
-    } else {
-        let next_start = fastq_frame::line_start(newlines, layout.complete_lines);
-        if layout.complete_lines == layout.line_count && next_start == input.len() {
-            return Ok(SlabResult {
-                next_start: input.len(),
-                records,
-            });
-        }
-        Ok(SlabResult {
-            next_start,
-            records,
-        })
-    }
-}
-
 fn pack_trusted_fastq_direct_slab(
     input: &[u8],
     context: SlabContext,
@@ -1175,22 +1100,23 @@ fn pack_trusted_fastq_direct_slab(
 ) -> FastqResult<SlabResult> {
     let mut cursor = 0;
     let mut records = 0_u64;
+    let mut newlines = memchr::memchr_iter(b'\n', input);
 
     while cursor < input.len() {
         let record_start = cursor;
-        let Some(name) = fastq_frame::direct_line(input, &mut cursor, context.eof) else {
+        let Some(name) = trusted_direct_line(input, &mut cursor, &mut newlines, context.eof) else {
             return Ok(SlabResult {
                 next_start: record_start,
                 records,
             });
         };
-        let Some(seq) = fastq_frame::direct_line(input, &mut cursor, context.eof) else {
+        let Some(seq) = trusted_direct_line(input, &mut cursor, &mut newlines, context.eof) else {
             return incomplete_or_truncated_direct(input, context, record_start, records, 1);
         };
-        let Some(plus) = fastq_frame::direct_line(input, &mut cursor, context.eof) else {
+        let Some(plus) = trusted_direct_line(input, &mut cursor, &mut newlines, context.eof) else {
             return incomplete_or_truncated_direct(input, context, record_start, records, 2);
         };
-        let Some(qual) = fastq_frame::direct_line(input, &mut cursor, context.eof) else {
+        let Some(qual) = trusted_direct_line(input, &mut cursor, &mut newlines, context.eof) else {
             return incomplete_or_truncated_direct(input, context, record_start, records, 3);
         };
         let record = RecordLines {
@@ -1214,6 +1140,35 @@ fn pack_trusted_fastq_direct_slab(
     Ok(SlabResult {
         next_start: input.len(),
         records,
+    })
+}
+
+fn trusted_direct_line<'a>(
+    input: &'a [u8],
+    cursor: &mut usize,
+    newlines: &mut impl Iterator<Item = usize>,
+    eof: bool,
+) -> Option<Line<'a>> {
+    let start = *cursor;
+    if start >= input.len() {
+        return None;
+    }
+
+    let end = match newlines.next() {
+        Some(end) => {
+            *cursor = end + 1;
+            end
+        }
+        None if eof => {
+            *cursor = input.len();
+            input.len()
+        }
+        None => return None,
+    };
+    let end = fastq_frame::trim_cr_end(input, start, end);
+    Some(Line {
+        bytes: &input[start..end],
+        start,
     })
 }
 
@@ -1340,9 +1295,8 @@ fn pack_bases_exact_zeroed(seq: &[u8], bases: &mut [u8], n_mask: &mut [u8]) -> B
     let mut base_index = 0;
     #[cfg(feature = "simd")]
     while chunk_index + 4 <= full_chunks {
-        let codes = base_codes_16(&seq[base_index..base_index + 16]);
-        pack_code_quads(
-            &codes,
+        pack_seq_16(
+            &seq[base_index..base_index + 16],
             base_index,
             &mut bases[chunk_index..chunk_index + 4],
             &mut summary,
@@ -1415,9 +1369,8 @@ fn pack_bases_and_qualities_exact_zeroed(
     let mut base_index = 0;
     #[cfg(feature = "simd")]
     while chunk_index + 4 <= full_chunks {
-        let codes = base_codes_16(&seq[base_index..base_index + 16]);
-        pack_code_quads(
-            &codes,
+        pack_seq_16(
+            &seq[base_index..base_index + 16],
             base_index,
             &mut bases[chunk_index..chunk_index + 4],
             &mut bases_summary,
@@ -1503,9 +1456,8 @@ unsafe fn pack_bases_and_qualities_exact_avx2(
 
     while base_index + 32 <= seq.len() {
         let block_start = base_index;
-        let first_codes = base_codes_16(&seq[base_index..base_index + 16]);
-        pack_code_quads(
-            &first_codes,
+        pack_seq_16(
+            &seq[base_index..base_index + 16],
             base_index,
             &mut bases[chunk_index..chunk_index + 4],
             &mut bases_summary,
@@ -1514,9 +1466,8 @@ unsafe fn pack_bases_and_qualities_exact_avx2(
         base_index += 16;
         chunk_index += 4;
 
-        let second_codes = base_codes_16(&seq[base_index..base_index + 16]);
-        pack_code_quads(
-            &second_codes,
+        pack_seq_16(
+            &seq[base_index..base_index + 16],
             base_index,
             &mut bases[chunk_index..chunk_index + 4],
             &mut bases_summary,
@@ -1596,75 +1547,62 @@ unsafe fn pack_bases_and_qualities_exact_avx2(
 }
 
 #[cfg(feature = "simd")]
-fn base_codes_16(seq: &[u8]) -> [u8; 16] {
-    debug_assert!(seq.len() >= 16);
-    let mut codes = [BASE_N; 16];
-    let mut i = 0;
-    while i < 16 {
-        codes[i] = BASE_LUT[usize::from(seq[i])];
-        i += 1;
-    }
-    codes
-}
-
-#[cfg(feature = "simd")]
-fn pack_code_quads(
-    codes: &[u8; 16],
+#[inline(always)]
+fn pack_seq_16(
+    seq: &[u8],
     base_index: usize,
     bases: &mut [u8],
     summary: &mut BaseSummary,
     n_mask: &mut [u8],
 ) {
-    if codes_are_canonical(codes) {
-        pack_canonical_code_quads(codes, bases, summary);
-        return;
+    debug_assert!(seq.len() >= 16);
+    debug_assert!(bases.len() >= 4);
+    debug_assert_eq!(base_index % 8, 0);
+
+    let e0 = quad_entry_from_bases(seq[0], seq[1], seq[2], seq[3]);
+    let e1 = quad_entry_from_bases(seq[4], seq[5], seq[6], seq[7]);
+    let e2 = quad_entry_from_bases(seq[8], seq[9], seq[10], seq[11]);
+    let e3 = quad_entry_from_bases(seq[12], seq[13], seq[14], seq[15]);
+
+    bases[0] = e0 as u8;
+    bases[1] = e1 as u8;
+    bases[2] = e2 as u8;
+    bases[3] = e3 as u8;
+
+    let mask01 = (((e0 >> 8) & 0x0f) | (((e1 >> 8) & 0x0f) << 4)) as u8;
+    if mask01 != 0 {
+        n_mask[base_index / 8] |= mask01;
+    }
+    let mask23 = (((e2 >> 8) & 0x0f) | (((e3 >> 8) & 0x0f) << 4)) as u8;
+    if mask23 != 0 {
+        n_mask[base_index / 8 + 1] |= mask23;
     }
 
-    let mut quad = 0;
-    while quad < 4 {
-        let code_index = quad * 4;
-        let index = base_index + code_index;
-        pack_quad_from_codes(
-            codes[code_index],
-            codes[code_index + 1],
-            codes[code_index + 2],
-            codes[code_index + 3],
-            index,
-            &mut bases[quad],
-            summary,
-            n_mask,
-        );
-        quad += 1;
-    }
+    summary.a += entry_count_4(e0, e1, e2, e3, 12);
+    summary.c += entry_count_4(e0, e1, e2, e3, 15);
+    summary.g += entry_count_4(e0, e1, e2, e3, 18);
+    summary.t += entry_count_4(e0, e1, e2, e3, 21);
+    summary.n += entry_count_4(e0, e1, e2, e3, 24);
 }
 
 #[cfg(feature = "simd")]
 #[inline(always)]
-fn codes_are_canonical(codes: &[u8; 16]) -> bool {
-    let mut combined = 0_u8;
-    let mut i = 0;
-    while i < 16 {
-        combined |= codes[i];
-        i += 1;
-    }
-    combined < BASE_N
+fn quad_entry_from_bases(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+    quad_entry_from_codes(
+        BASE_LUT[usize::from(b0)],
+        BASE_LUT[usize::from(b1)],
+        BASE_LUT[usize::from(b2)],
+        BASE_LUT[usize::from(b3)],
+    )
 }
 
 #[cfg(feature = "simd")]
 #[inline(always)]
-fn pack_canonical_code_quads(codes: &[u8; 16], bases: &mut [u8], summary: &mut BaseSummary) {
-    let mut quad = 0;
-    while quad < 4 {
-        let i = quad * 4;
-        bases[quad] = codes[i] | (codes[i + 1] << 2) | (codes[i + 2] << 4) | (codes[i + 3] << 6);
-        quad += 1;
-    }
-
-    let mut i = 0;
-    while i < 16 {
-        add_base_count(summary, codes[i]);
-        i += 1;
-    }
+fn entry_count_4(e0: u32, e1: u32, e2: u32, e3: u32, shift: u32) -> usize {
+    (((e0 >> shift) & 0x07)
+        + ((e1 >> shift) & 0x07)
+        + ((e2 >> shift) & 0x07)
+        + ((e3 >> shift) & 0x07)) as usize
 }
 
 #[inline(always)]
@@ -1680,12 +1618,25 @@ fn pack_quad_from_codes(
     n_mask: &mut [u8],
 ) {
     apply_quad_entry(
-        BASE_QUAD_LUT[quad_key(c0, c1, c2, c3)],
+        quad_entry_from_codes(c0, c1, c2, c3),
         base_index,
         base_out,
         summary,
         n_mask,
     );
+}
+
+#[inline(always)]
+fn quad_entry_from_codes(c0: u8, c1: u8, c2: u8, c3: u8) -> u32 {
+    debug_assert!(c0 <= BASE_N);
+    debug_assert!(c1 <= BASE_N);
+    debug_assert!(c2 <= BASE_N);
+    debug_assert!(c3 <= BASE_N);
+    let key = quad_key(c0, c1, c2, c3);
+    debug_assert!(key < BASE_QUAD_LUT.len());
+    // Codes are produced by BASE_LUT, whose only values are 0..=BASE_N, so
+    // the base-5 quad key is always inside BASE_QUAD_LUT.
+    unsafe { *BASE_QUAD_LUT.get_unchecked(key) }
 }
 
 #[inline(always)]

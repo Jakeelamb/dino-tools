@@ -11,6 +11,18 @@ documentation = "https://docs.rs/dino-seq"
 keywords = ["fastq", "fasta", "bioinformatics", "bgzf", "sequencing"]
 categories = ["science", "parser-implementations"]
 rust-version = "1.87"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "BENCHMARKING.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "docs/API_SURFACE.md",
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "benches/**",
+]
 
 [lib]
 name = "dino_seq"
@@ -18,14 +30,6 @@ name = "dino_seq"
 [[bin]]
 name = "dino-seq"
 path = "src/bin/dino_seq.rs"
-
-[[bin]]
-name = "dino-seq-bench"
-path = "src/bin/dino_seq_bench.rs"
-
-[[bin]]
-name = "dino-seq-fixture"
-path = "src/bin/dino_seq_fixture.rs"
 
 [dependencies]
 crc32fast = { version = "1.5", optional = true }
@@ -46,11 +50,6 @@ asm-scan = []
 
 [lints.rust]
 unsafe_code = "allow"
-
-[lints.clippy]
-unwrap_used = "allow"
-expect_used = "allow"
-panic = "allow"
 
 [[bench]]
 name = "throughput"

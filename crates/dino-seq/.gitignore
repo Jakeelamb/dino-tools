@@ -1,3 +1,10 @@
 /target
 /.agents
 /.codex
+/.venv-figures
+/docs/benchmarks/
+/scripts/__pycache__/
+/fuzz/artifacts/
+/replication-kit/
+/tools/perf/gungraun/.bin/
+/tools/perf/gungraun/target/

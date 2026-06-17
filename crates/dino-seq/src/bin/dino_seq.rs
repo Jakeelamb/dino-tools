@@ -3,7 +3,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 
-use dino_seq::benchutil::{consume_fasta, consume_fastq};
 use dino_seq::{
     FastaIndex, FastaPartitionConfig, IndexedFastaReader, Result, build_fasta_index, open_fasta,
     open_fastq, plan_fasta_partitions,
@@ -109,8 +108,8 @@ fn checksum(args: Vec<String>) -> Result<()> {
             }
         }
     }
-    let format = format
-        .ok_or_else(|| dino_seq::FastqError::Format("checksum requires --format".into()))?;
+    let format =
+        format.ok_or_else(|| dino_seq::FastqError::Format("checksum requires --format".into()))?;
     let reader = input_reader(path.as_deref())?;
     let stats = match format.as_str() {
         "fastq" => {
@@ -139,8 +138,51 @@ fn input_reader(path: Option<&str>) -> Result<Box<dyn Read>> {
     }
 }
 
-fn consume_sam_sequences<R: Read>(reader: R) -> Result<dino_seq::benchutil::StreamStats> {
-    let mut stats = dino_seq::benchutil::StreamStats::default();
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamStats {
+    records: u64,
+    bases: u64,
+    qualities: u64,
+    name_bytes: u64,
+    checksum: u64,
+}
+
+impl StreamStats {
+    fn observe_record(&mut self, name: &[u8], seq: &[u8], qual: &[u8]) {
+        self.records += 1;
+        self.bases += seq.len() as u64;
+        self.qualities += qual.len() as u64;
+        self.name_bytes += name.len() as u64;
+        self.checksum = self
+            .checksum
+            .wrapping_add(seq.first().copied().unwrap_or_default() as u64)
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(seq.len() as u64);
+    }
+}
+
+fn consume_fastq<R: Read>(reader: &mut dino_seq::FastqReader<R>) -> Result<StreamStats> {
+    let mut stats = StreamStats::default();
+    while let Some(batch) = reader.next_batch()? {
+        for record in batch.records() {
+            stats.observe_record(record.name(), record.seq(), record.qual());
+        }
+    }
+    Ok(stats)
+}
+
+fn consume_fasta<R: Read>(reader: &mut dino_seq::FastaReader<R>) -> Result<StreamStats> {
+    let mut stats = StreamStats::default();
+    while let Some(batch) = reader.next_batch()? {
+        for record in batch.records() {
+            stats.observe_record(record.name(), record.seq(), b"");
+        }
+    }
+    Ok(stats)
+}
+
+fn consume_sam_sequences<R: Read>(reader: R) -> Result<StreamStats> {
+    let mut stats = StreamStats::default();
     let mut line = Vec::new();
     let mut reader = BufReader::new(reader);
     loop {
@@ -210,9 +252,8 @@ fn fasta_fetch(args: Vec<String>) -> Result<()> {
     let name =
         name.ok_or_else(|| dino_seq::FastqError::Format("fasta-fetch requires --name".into()))?;
     let range = Range {
-        start: start.ok_or_else(|| {
-            dino_seq::FastqError::Format("fasta-fetch requires --start".into())
-        })?,
+        start: start
+            .ok_or_else(|| dino_seq::FastqError::Format("fasta-fetch requires --start".into()))?,
         end: end
             .ok_or_else(|| dino_seq::FastqError::Format("fasta-fetch requires --end".into()))?,
     };
@@ -263,9 +304,8 @@ fn fasta_partitions(args: Vec<String>) -> Result<()> {
     }
     let _path = required_path(path, "fasta-partitions")?;
     let fai = required_path(fai, "fasta-partitions --fai")?;
-    let parts = parts.ok_or_else(|| {
-        dino_seq::FastqError::Format("fasta-partitions requires --parts".into())
-    })?;
+    let parts = parts
+        .ok_or_else(|| dino_seq::FastqError::Format("fasta-partitions requires --parts".into()))?;
     let index = FastaIndex::from_fai_read(File::open(fai)?)?;
     for partition in plan_fasta_partitions(&index, FastaPartitionConfig::new(parts, overlap))? {
         println!(
@@ -314,9 +354,8 @@ fn fasta_chunks(args: Vec<String>) -> Result<()> {
     let name =
         name.ok_or_else(|| dino_seq::FastqError::Format("fasta-chunks requires --name".into()))?;
     let range = Range {
-        start: start.ok_or_else(|| {
-            dino_seq::FastqError::Format("fasta-chunks requires --start".into())
-        })?,
+        start: start
+            .ok_or_else(|| dino_seq::FastqError::Format("fasta-chunks requires --start".into()))?,
         end: end
             .ok_or_else(|| dino_seq::FastqError::Format("fasta-chunks requires --end".into()))?,
     };
@@ -373,7 +412,7 @@ fn verify_bgzf(args: Vec<String>) -> Result<()> {
     }
 }
 
-fn print_stream_stats(stats: &dino_seq::benchutil::StreamStats) {
+fn print_stream_stats(stats: &StreamStats) {
     println!("records\t{}", stats.records);
     println!("bases\t{}", stats.bases);
     println!("qualities\t{}", stats.qualities);

@@ -75,6 +75,151 @@ fn visit_records_matches_batch_records_across_slab_carry() {
 }
 
 #[test]
+fn next_chunk_with_sink_stops_and_resumes_at_record_boundary() {
+    let input = b"@r1\nAAAA\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n@r3\nGG\n+\n!!\n";
+    let mut reader = FastqReader::with_config(
+        &input[..],
+        FastqConfig {
+            slab_size: 1024,
+            validate: true,
+            ..FastqConfig::default()
+        },
+    );
+    let config = FastqChunkConfig::new(5).min_records(2);
+    let mut first = Vec::new();
+
+    let first_stats = reader
+        .next_chunk_with_sink(config, &mut |record: FastqVisitRecord<'_>| {
+            first.push((record.name().to_vec(), record.seq().to_vec()));
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        first,
+        vec![
+            (b"@r1".to_vec(), b"AAAA".to_vec()),
+            (b"@r2".to_vec(), b"CCCC".to_vec())
+        ]
+    );
+    assert_eq!(
+        first_stats,
+        FastqChunkStats {
+            first_record_index: 0,
+            records: 2,
+            bases: 8
+        }
+    );
+
+    let mut second = Vec::new();
+    let second_stats = reader
+        .next_chunk_with_sink(config, &mut |record: FastqVisitRecord<'_>| {
+            second.push((record.name().to_vec(), record.seq().to_vec()));
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(second, vec![(b"@r3".to_vec(), b"GG".to_vec())]);
+    assert_eq!(
+        second_stats,
+        FastqChunkStats {
+            first_record_index: 2,
+            records: 1,
+            bases: 2
+        }
+    );
+    assert!(
+        reader
+            .next_chunk_with_sink(config, &mut |_: FastqVisitRecord<'_>| Ok(()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn next_chunk_with_sink_matches_batch_records_across_slab_carry() {
+    let input = b"@r1\nACGT\n+\nIIII\n@r2\nTGCA\n+\nJJJJ\n@r3\nNN\n+\n!!";
+    let expected = collect_records(input, 18).unwrap();
+    let mut reader = FastqReader::with_config(
+        &input[..],
+        FastqConfig {
+            slab_size: 18,
+            validate: true,
+            ..FastqConfig::default()
+        },
+    );
+    let mut visited = Vec::new();
+
+    while reader
+        .next_chunk_with_sink(FastqChunkConfig::new(4), &mut |record: FastqVisitRecord<
+            '_,
+        >| {
+            visited.push((record.name().to_vec(), record.seq().to_vec()));
+            Ok(())
+        })
+        .unwrap()
+        .is_some()
+    {}
+
+    assert_eq!(visited, expected);
+}
+
+#[test]
+fn next_chunk_with_sink_reports_truncated_eof() {
+    let mut reader = FastqReader::new(&b"@r1\nACGT\n+"[..]);
+    let err = reader
+        .next_chunk_with_sink(FastqChunkConfig::new(4), &mut |_: FastqVisitRecord<'_>| {
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("truncated FASTQ record"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(0, 0, 3)));
+}
+
+#[test]
+fn next_chunk_with_sink_propagates_sink_errors() {
+    let mut reader = FastqReader::new(&b"@r1\nACGT\n+\nIIII\n@r2\nTGCA\n+\nJJJJ\n"[..]);
+    let mut seen = 0;
+    let err = reader
+        .next_chunk_with_sink(FastqChunkConfig::new(8), &mut |_: FastqVisitRecord<'_>| {
+            seen += 1;
+            Err(crate::FastqError::Format("sink rejected record".into()))
+        })
+        .unwrap_err();
+
+    assert_eq!(seen, 1);
+    assert!(err.to_string().contains("sink rejected record"));
+}
+
+#[test]
+fn chunk_config_and_stats_accessors_are_adopter_friendly() {
+    let config = FastqChunkConfig::new(1_000)
+        .min_records(10)
+        .max_bases(2_000);
+    assert_eq!(config.target_bases(), 1_000);
+    assert_eq!(config.min_records_value(), 10);
+    assert_eq!(config.max_bases_value(), 2_000);
+    assert_eq!(config.estimated_records(150), 14);
+
+    let input = b"@r1\nAAAA\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n";
+    let mut reader = FastqReader::new(&input[..]);
+    let stats = reader
+        .next_chunk_with_sink(FastqChunkConfig::new(1), &mut |_: FastqVisitRecord<'_>| {
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(stats.first_record_index(), 0);
+    assert_eq!(stats.records(), 1);
+    assert_eq!(stats.bases(), 4);
+    assert!(!stats.is_empty());
+}
+
+#[test]
 fn visit_records_reports_truncated_eof() {
     let mut reader = FastqReader::new(&b"@r1\nACGT\n+"[..]);
     let err = reader.visit_records(|_| Ok(())).unwrap_err();

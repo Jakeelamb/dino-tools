@@ -1,0 +1,7 @@
+[package]
+name = "dino-quant"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dino-seq = { path = "../dino-seq" }

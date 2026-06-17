@@ -9,6 +9,7 @@ development can build and test the checked-in tools together.
 ## Current Shape
 
 - `crates/dino-seq`: FASTQ/FASTA streaming parser and ingest CLI.
+- `crates/dino-quant`: TurboQuant-inspired DNA sketch compression experiments.
 - `dna/`: nucleotide terminal animations (`DNA` CLI).
 - `CHANGELOG.md`: reviewable history for workspace-level changes only.
 
@@ -28,6 +29,7 @@ cargo install --path dna
 
 ```sh
 cargo run -p dino-seq -- stats --help
+cargo run -p dino-quant -- demo
 cargo run -p dna --bin DNA -- --help
 cargo test --workspace
 ```

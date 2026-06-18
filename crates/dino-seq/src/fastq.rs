@@ -2,7 +2,6 @@ use std::io::Read;
 
 use crate::error::{FastqError, Result};
 use crate::fastq_frame;
-use crate::scan::scan_newlines;
 
 mod chunk;
 mod frame;
@@ -10,8 +9,8 @@ mod pair;
 mod record;
 
 pub use chunk::{FastqChunkConfig, FastqChunkSinkExt, FastqChunkStats, FastqRecordSink};
-use frame::visit_records_in_slab;
 use frame::{ChunkVisitContext, frame_records, visit_chunk_in_slab};
+use frame::{count_records_in_slab, visit_records_in_slab};
 pub use pair::{
     FastqPair, InterleavedPairs, PairValidation, PairedFastqBatch, PairedFastqPairs,
     PairedFastqReader, PairedRecords, PairingMode, paired_records,
@@ -19,11 +18,11 @@ pub use pair::{
 use pair::{validate_even_pair_count, validate_interleaved_pair_ids, validate_paired_batches};
 pub use record::{FastqRecord, FastqVisitRecord, RecordRef, strip_pair_suffix};
 
-const DEFAULT_SLAB_SIZE: usize = 256 * 1024;
+const DEFAULT_SLAB_SIZE: usize = 1024 * 1024;
 
 /// Configuration for FASTQ batch readers.
 ///
-/// The default is a validated, unpaired reader with a 256 KiB slab and full pair
+/// The default is a validated, unpaired reader with a 1 MiB slab and full pair
 /// identifier validation when pairing APIs are used.
 #[derive(Debug, Clone)]
 pub struct FastqConfig {
@@ -66,6 +65,21 @@ impl FastqConfig {
         self.pair_validation = pair_validation;
         self
     }
+}
+
+/// Aggregate statistics for sequence-only FASTQ workloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FastqStats {
+    /// Number of records observed.
+    pub records: u64,
+    /// Number of sequence bases observed.
+    pub bases: u64,
+    /// Number of quality bytes observed.
+    pub qualities: u64,
+    /// Number of header bytes observed, including leading `@`.
+    pub name_bytes: u64,
+    /// Lightweight deterministic checksum over record shape and first bases.
+    pub checksum: u64,
 }
 
 /// A batch of borrowed FASTQ records from one reader slab.
@@ -175,10 +189,10 @@ pub struct FastqReader<R> {
     buf: Vec<u8>,
     len: usize,
     next_start: usize,
+    chunk_resume_start: usize,
     base_offset: u64,
     record_index: u64,
     eof: bool,
-    newlines: Vec<usize>,
     records: Vec<RecordRef>,
 }
 
@@ -201,10 +215,10 @@ impl<R: Read> FastqReader<R> {
             buf,
             len: 0,
             next_start: 0,
+            chunk_resume_start: 0,
             base_offset: 0,
             record_index: 0,
             eof: false,
-            newlines: Vec::new(),
             records: Vec::new(),
         }
     }
@@ -223,11 +237,9 @@ impl<R: Read> FastqReader<R> {
         self.fill_slab()?;
 
         self.records.clear();
-        scan_newlines(&self.buf[..self.len], &mut self.newlines);
         let first_record_index = self.record_index;
         self.next_start = frame_records(
             &self.buf[..self.len],
-            &self.newlines,
             self.eof,
             self.config.validate,
             self.base_offset,
@@ -294,6 +306,41 @@ impl<R: Read> FastqReader<R> {
         }
     }
 
+    /// Count remaining records and bases without building record views.
+    ///
+    /// This consumes the reader to EOF. It validates the same four-line FASTQ
+    /// structure as [`visit_records`](Self::visit_records) when
+    /// [`FastqConfig::validate`] is enabled, but it avoids the per-record
+    /// visitor callback and borrowed-record construction.
+    #[inline]
+    pub fn count_records(&mut self) -> Result<FastqStats> {
+        let mut stats = FastqStats::default();
+        loop {
+            self.compact_carry();
+            self.fill_slab()?;
+
+            let (next_start, records) = count_records_in_slab(
+                &self.buf[..self.len],
+                self.eof,
+                self.config.validate,
+                self.base_offset,
+                self.record_index,
+                &mut stats,
+            )?;
+            self.next_start = next_start;
+            self.record_index += records;
+
+            if records == 0 {
+                if self.len == 0 && self.eof {
+                    return Ok(stats);
+                }
+                return Err(FastqError::RecordTooLarge {
+                    slab_size: self.config.slab_size,
+                });
+            }
+        }
+    }
+
     /// Emit one resumable chunk of FASTQ records into a caller-owned sink.
     ///
     /// This is the low-overhead path for downstream tools that already have a
@@ -317,22 +364,35 @@ impl<R: Read> FastqReader<R> {
         let mut chunk = FastqChunkStats::new(first_record_index);
 
         loop {
-            self.compact_carry();
-            self.fill_slab()?;
+            let parse_start = if self.chunk_resume_start == 0 {
+                self.compact_carry();
+                self.fill_slab()?;
+                0
+            } else {
+                let parse_start = self.chunk_resume_start;
+                self.chunk_resume_start = 0;
+                parse_start
+            };
 
             let (next_start, records, bases, stopped) = visit_chunk_in_slab(
-                &self.buf[..self.len],
+                &self.buf[parse_start..self.len],
                 ChunkVisitContext {
                     eof: self.eof,
                     validate: self.config.validate,
-                    base_offset: self.base_offset,
+                    base_offset: self.base_offset + parse_start as u64,
                     first_record_index: self.record_index,
                     config,
                 },
                 &chunk,
                 sink,
             )?;
-            self.next_start = next_start;
+            let next_start = parse_start + next_start;
+            if stopped && next_start < self.len {
+                self.chunk_resume_start = next_start;
+                self.next_start = 0;
+            } else {
+                self.next_start = next_start;
+            }
             self.record_index += records;
             chunk.records += records;
             chunk.bases += bases;
@@ -356,6 +416,10 @@ impl<R: Read> FastqReader<R> {
     }
 
     fn compact_carry(&mut self) {
+        if self.chunk_resume_start != 0 {
+            self.next_start = self.chunk_resume_start;
+            self.chunk_resume_start = 0;
+        }
         if self.next_start == 0 {
             return;
         }
@@ -410,6 +474,7 @@ impl<R: Read> FastqReader<R> {
     }
 
     fn retain_records_from_parts(&mut self, next_start: usize, record_count: usize) {
+        self.chunk_resume_start = 0;
         self.next_start = next_start;
         self.record_index -= record_count as u64;
     }
@@ -431,6 +496,27 @@ where
     let (_, records) = visit_records_in_slab(bytes, true, config.validate, 0, 0, &mut visit)?;
 
     Ok(records)
+}
+
+/// Count records and bases from a FASTQ reader without building record views.
+#[inline]
+pub fn count_fastq_read<R: Read>(reader: R) -> Result<FastqStats> {
+    count_fastq_read_with_config(reader, FastqConfig::default())
+}
+
+/// Count records and bases from a FASTQ reader with explicit parser settings.
+#[inline]
+pub fn count_fastq_read_with_config<R: Read>(reader: R, config: FastqConfig) -> Result<FastqStats> {
+    let mut reader = FastqReader::with_config(reader, config);
+    reader.count_records()
+}
+
+/// Count records and bases from an already resident FASTQ byte slice.
+#[inline]
+pub fn count_fastq_bytes(bytes: &[u8], config: FastqConfig) -> Result<FastqStats> {
+    let mut stats = FastqStats::default();
+    count_records_in_slab(bytes, true, config.validate, 0, 0, &mut stats)?;
+    Ok(stats)
 }
 
 #[cfg(test)]

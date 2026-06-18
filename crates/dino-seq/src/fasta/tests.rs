@@ -39,16 +39,6 @@ fn owned_fasta_batch_can_outlive_reader_batch() {
 }
 
 #[test]
-fn fasta_reader_implements_batch_source_trait() {
-    use crate::FastaBatchSource;
-
-    let input = b">seq1\nAC\n";
-    let mut reader = FastaReader::new(&input[..]);
-    let batch = reader.next_fasta_batch().unwrap().unwrap();
-    assert_eq!(batch.records().next().unwrap().seq(), b"AC");
-}
-
-#[test]
 fn reference_config_matches_reference_opener_tuning() {
     let config = FastaConfig::reference();
     assert_eq!(config.batch_records, 16);
@@ -210,6 +200,35 @@ fn counts_wrapped_fasta_read_and_bytes() {
     assert_eq!(from_reader, from_read);
     assert_eq!(from_read.records, 2);
     assert_eq!(from_read.bases, 8);
+}
+
+#[test]
+fn resident_count_matches_visitor_without_folding_records() {
+    let input = b"\n>seq1 description\nAC\nGT\n\n>empty\n>seq3\nTTA\n";
+    let stats = count_fasta_bytes(input).unwrap();
+    let mut from_visitor = FastaStats::default();
+
+    visit_fasta_bytes(input, |record| {
+        from_visitor.observe_sequence(record.seq());
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(stats, from_visitor);
+    assert_eq!(stats.records, 3);
+    assert_eq!(stats.bases, 7);
+}
+
+#[test]
+fn count_fasta_bufread_handles_split_lines() {
+    let input = b">seq1 description\nACGTACGT\nTT\n>seq2\nA\nCCGG\n";
+    let mut tiny = BufReader::with_capacity(3, &input[..]);
+    let from_tiny = count_fasta_bufread(&mut tiny).unwrap();
+    let from_bytes = count_fasta_bytes(input).unwrap();
+
+    assert_eq!(from_tiny, from_bytes);
+    assert_eq!(from_tiny.records, 2);
+    assert_eq!(from_tiny.bases, 15);
 }
 
 #[test]
@@ -561,6 +580,20 @@ fn indexed_fetch_handles_line_boundary_and_missing_final_newline() {
     assert_eq!(reader.fetch(b"chr1", 0..4).unwrap(), b"ACGT");
     assert_eq!(reader.fetch(b"chr1", 0..8).unwrap(), b"ACGTTGCA");
     assert_eq!(reader.fetch(b"chr1", 4..8).unwrap(), b"TGCA");
+}
+
+#[test]
+fn indexed_fetch_skips_crlf_line_endings_with_run_copy() {
+    let input = b">chr1\r\nACGT\r\nTGCA\r\nAA\r\n";
+    let index = build_fasta_index(&input[..]).unwrap();
+    let chr1 = index.get(b"chr1").unwrap();
+    assert_eq!(chr1.line_bases, 4);
+    assert_eq!(chr1.line_width, 6);
+
+    let mut reader = IndexedFastaReader::new(std::io::Cursor::new(input), index);
+
+    assert_eq!(reader.fetch(b"chr1", 2..8).unwrap(), b"GTTGCA");
+    assert_eq!(reader.fetch(b"chr1", 8..10).unwrap(), b"AA");
 }
 
 #[test]

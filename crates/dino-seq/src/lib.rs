@@ -1,25 +1,25 @@
 #![warn(missing_docs)]
-//! Streaming FASTQ and FASTA parsing for raw, gzip, and BGZF inputs.
+//! Low-allocation FASTQ and FASTA parsing.
 //!
 //! Dino Seq is a library core for downstream scientific tools that need
 //! low-allocation streams of ordinary FASTQ records and multiline FASTA
-//! records. Decompression is treated as a transport layer: raw, gzip, and BGZF
-//! inputs feed the same parser for each sequence format.
+//! records. The default crate is the raw parser core; gzip and BGZF transports
+//! are explicit feature opt-ins.
 //!
-//! The default feature set builds on stable Rust and includes gzip and BGZF
-//! input support through flate2's pure-Rust backend. SIMD acceleration is
-//! available through the explicit `simd` feature on stable Rust targets that
-//! expose supported `std::arch` intrinsics.
+//! The default feature set builds on stable Rust with no compression
+//! dependencies. SIMD acceleration is available through the explicit `simd`
+//! feature on stable Rust targets that expose supported `std::arch` intrinsics.
 //!
 //! # Choosing an entry point
 //!
-//! Use [`FastqReader`] when you already have an object that implements
-//! [`std::io::Read`]. Use [`visit_fastq_bytes`] when a complete FASTQ byte
-//! buffer is already resident in memory. Use [`open_fastq`] or
-//! [`open_fastq_with_config`] when you want file-path auto-detection for raw
-//! FASTQ, ordinary gzip, and BGZF. Use [`PairedFastqReader`] or
-//! [`open_paired_fastq`] for ordered R1/R2 streams. Use [`FastaReader`] or
-//! [`open_fasta`] for raw, gzip, or BGZF FASTA streams. Use
+//! Use [`FastqReader`] or [`FastaReader`] directly over a concrete
+//! [`std::fs::File`] for raw-file hot paths. Use [`count_fastq_read`] for
+//! count/stat workloads that do not need record views. Use [`visit_fastq_bytes`]
+//! when a complete FASTQ byte buffer is already resident in memory. Use
+//! [`open_fastq`], [`open_fastq_with_config`], [`open_fasta`], or
+//! [`open_fasta_with_config`] when file-path convenience and optional
+//! gzip/BGZF magic detection are worth the boxed transport. Use
+//! [`PairedFastqReader`] or [`open_paired_fastq`] for ordered R1/R2 streams. Use
 //! [`visit_fasta_bytes`] for resident multiline FASTA, and
 //! [`visit_two_line_fasta_bytes`] or [`visit_two_line_fasta_read`] for strict
 //! canonical two-line FASTA fast paths.
@@ -47,9 +47,9 @@
 //! - `libdeflate` enables optional libdeflate BGZF backends and an explicit
 //!   buffered gzip opener.
 //! - `mmap` enables resident file visitors backed by memory maps.
-//! - `pure-rust-compression` selects the default Rust-only flate2 transport
-//!   stack. This is the crate default; `libdeflate` remains an explicit
-//!   third-party C-backed opt-in.
+//! - `transport` enables both `gzip` and `bgzf` for callers that want the old
+//!   all-transport convenience build.
+//! - `pure-rust-compression` is a compatibility alias for `transport`.
 //! - `simd` enables stable `std::arch` scanner and packing paths where
 //!   supported.
 //! - `asm-scan` (x86-64 only) uses a hand-written AVX2 newline scanner instead of
@@ -111,7 +111,6 @@ mod mmap;
 pub mod pack;
 mod scan;
 mod source;
-mod stream;
 
 #[cfg(feature = "bgzf")]
 pub use bgzf::{
@@ -136,12 +135,13 @@ pub use fasta::{
 };
 pub use fastq::{
     FastqBatch, FastqChunkConfig, FastqChunkSinkExt, FastqChunkStats, FastqConfig, FastqPair,
-    FastqReader, FastqRecord, FastqRecordSink, FastqVisitRecord, InterleavedPairs, PairValidation,
-    PairedFastqBatch, PairedFastqPairs, PairedFastqReader, PairedRecords, PairingMode, RecordRef,
+    FastqReader, FastqRecord, FastqRecordSink, FastqStats, FastqVisitRecord, InterleavedPairs,
+    PairValidation, PairedFastqBatch, PairedFastqPairs, PairedFastqReader, PairedRecords,
+    PairingMode, RecordRef, count_fastq_bytes, count_fastq_read, count_fastq_read_with_config,
     paired_records, strip_pair_suffix, visit_fastq_bytes,
 };
 #[cfg(feature = "mmap")]
-pub use mmap::{count_fasta_mmap, visit_fasta_mmap, visit_fastq_mmap};
+pub use mmap::{count_fasta_mmap, count_fastq_mmap, visit_fasta_mmap, visit_fastq_mmap};
 pub use source::{
     DetectedInputKind, detect_file_input_kind, open_fasta, open_fasta_for_reference,
     open_fasta_with_config, open_fastq, open_fastq_with_config, open_paired_fastq,
@@ -159,4 +159,3 @@ pub use source::{
     open_fastq_bgzf_parallel_with_backend, open_fastq_bgzf_parallel_with_config,
     open_fastq_bgzf_parallel_with_options, open_fastq_bgzf_with_backend,
 };
-pub use stream::{FastaBatchSource, FastqBatchSource, FastqPairBatchSource};

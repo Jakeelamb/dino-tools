@@ -4,8 +4,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use dino_seq::{
-    FastaIndex, FastaPartitionConfig, IndexedFastaReader, Result, build_fasta_index, open_fasta,
-    open_fastq, plan_fasta_partitions,
+    FastaIndex, FastaPartitionConfig, FastqStats, IndexedFastaReader, Result, build_fasta_index,
+    open_fasta, open_fastq, plan_fasta_partitions,
 };
 
 #[cfg(feature = "bgzf")]
@@ -72,7 +72,7 @@ fn stats(args: Vec<String>) -> Result<()> {
     match format.as_str() {
         "fastq" => {
             let mut reader = open_fastq(&path)?;
-            let stats = consume_fastq(&mut reader)?;
+            let stats = StreamStats::from(reader.count_records()?);
             print_stream_stats(&stats);
         }
         "fasta" => {
@@ -114,7 +114,7 @@ fn checksum(args: Vec<String>) -> Result<()> {
     let stats = match format.as_str() {
         "fastq" => {
             let mut reader = dino_seq::FastqReader::new(reader);
-            consume_fastq(&mut reader)?
+            StreamStats::from(reader.count_records()?)
         }
         "fasta" => {
             let mut reader = dino_seq::FastaReader::new(reader);
@@ -161,14 +161,16 @@ impl StreamStats {
     }
 }
 
-fn consume_fastq<R: Read>(reader: &mut dino_seq::FastqReader<R>) -> Result<StreamStats> {
-    let mut stats = StreamStats::default();
-    while let Some(batch) = reader.next_batch()? {
-        for record in batch.records() {
-            stats.observe_record(record.name(), record.seq(), record.qual());
+impl From<FastqStats> for StreamStats {
+    fn from(stats: FastqStats) -> Self {
+        Self {
+            records: stats.records,
+            bases: stats.bases,
+            qualities: stats.qualities,
+            name_bytes: stats.name_bytes,
+            checksum: stats.checksum,
         }
     }
-    Ok(stats)
 }
 
 fn consume_fasta<R: Read>(reader: &mut dino_seq::FastaReader<R>) -> Result<StreamStats> {

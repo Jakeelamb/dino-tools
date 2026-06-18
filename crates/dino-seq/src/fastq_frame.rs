@@ -32,34 +32,6 @@ impl RecordValidation {
     };
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct SlabLineLayout {
-    pub(crate) line_count: usize,
-    pub(crate) complete_lines: usize,
-    pub(crate) has_partial_trailing_line: bool,
-}
-
-pub(crate) fn slab_line_layout(
-    bytes: &[u8],
-    newline_offsets: &[usize],
-    eof: bool,
-) -> SlabLineLayout {
-    let has_partial_trailing_line = !eof
-        && newline_offsets
-            .last()
-            .map_or(!bytes.is_empty(), |&nl| nl + 1 < bytes.len());
-    let has_final_line = eof
-        && newline_offsets
-            .last()
-            .map_or(!bytes.is_empty(), |&nl| nl + 1 < bytes.len());
-    let line_count = newline_offsets.len() + usize::from(has_final_line);
-    SlabLineLayout {
-        line_count,
-        complete_lines: (line_count / 4) * 4,
-        has_partial_trailing_line,
-    }
-}
-
 #[inline]
 pub(crate) fn line_start(newline_offsets: &[usize], line: usize) -> usize {
     if line == 0 {

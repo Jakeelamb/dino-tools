@@ -1,57 +1,60 @@
 use crate::error::{FastqError, Result};
 use crate::fastq_frame;
 
+use super::FastqStats;
 use super::chunk::{FastqChunkConfig, FastqChunkStats, FastqRecordSink};
 use super::record::{FastqVisitRecord, RecordRef, to_u32_range};
 
 pub(super) fn frame_records(
     bytes: &[u8],
-    newline_offsets: &[usize],
     eof: bool,
     validate: bool,
     base_offset: u64,
     first_record_index: u64,
     records: &mut Vec<RecordRef>,
 ) -> Result<usize> {
-    let layout = fastq_frame::slab_line_layout(bytes, newline_offsets, eof);
-    if eof && !layout.line_count.is_multiple_of(4) {
-        let start = fastq_frame::line_start(newline_offsets, (layout.line_count / 4) * 4);
-        return Err(fastq_frame::format_at(
-            "truncated FASTQ record",
-            base_offset,
-            start,
-            first_record_index + records.len() as u64,
-            (layout.line_count % 4) as u8,
-        ));
-    }
     if bytes.len() > u32::MAX as usize {
         return Err(FastqError::Format(
             "FASTQ slab byte offsets exceed u32 range".into(),
         ));
     }
-    records.reserve(layout.complete_lines / 4);
+    records.reserve(bytes.len() / 128);
 
-    let mut line = 0;
-    let mut name_start = 0;
-    while line < layout.complete_lines {
-        debug_assert!(line + 2 < newline_offsets.len());
-        let name_end = fastq_frame::trim_cr_end(bytes, name_start, newline_offsets[line]);
-        let seq_start = newline_offsets[line] + 1;
-        let seq_end = fastq_frame::trim_cr_end(bytes, seq_start, newline_offsets[line + 1]);
-        let plus_start = newline_offsets[line + 1] + 1;
-        let plus_end = fastq_frame::trim_cr_end(bytes, plus_start, newline_offsets[line + 2]);
-        let qual_start = newline_offsets[line + 2] + 1;
-        let qual_line = line + 3;
-        let qual_raw_end = if qual_line < newline_offsets.len() {
-            newline_offsets[qual_line]
-        } else {
-            bytes.len()
+    let mut cursor = 0;
+    let mut newlines = memchr::memchr_iter(b'\n', bytes);
+
+    while cursor < bytes.len() {
+        let record_start = cursor;
+        let Some(name) = next_visit_line_bounds(bytes, &mut cursor, &mut newlines, eof) else {
+            return Ok(record_start);
         };
-        let qual_end = fastq_frame::trim_cr_end(bytes, qual_start, qual_raw_end);
-        let name = (name_start, name_end);
-        let seq = (seq_start, seq_end);
-        let plus = (plus_start, plus_end);
-        let qual = (qual_start, qual_end);
+        let Some(seq) = next_visit_line_bounds(bytes, &mut cursor, &mut newlines, eof) else {
+            return incomplete_or_truncated_frame(
+                eof,
+                base_offset,
+                record_start,
+                first_record_index + records.len() as u64,
+                1,
+            );
+        };
+        let Some(plus) = next_visit_line_bounds(bytes, &mut cursor, &mut newlines, eof) else {
+            return incomplete_or_truncated_frame(
+                eof,
+                base_offset,
+                record_start,
+                first_record_index + records.len() as u64,
+                2,
+            );
+        };
+        let Some(qual) = next_visit_line_bounds(bytes, &mut cursor, &mut newlines, eof) else {
+            return incomplete_or_truncated_frame(
+                eof,
+                base_offset,
+                record_start,
+                first_record_index + records.len() as u64,
+                3,
+            );
+        };
 
         if validate {
             validate_record_ranges(
@@ -71,20 +74,28 @@ pub(super) fn frame_records(
             plus: to_u32_range(plus.0..plus.1),
             qual: to_u32_range(qual.0..qual.1),
         });
-        line += 4;
-        if line < layout.complete_lines {
-            name_start = newline_offsets[line - 1] + 1;
-        }
     }
 
-    if layout.complete_lines == layout.line_count && !layout.has_partial_trailing_line {
-        Ok(bytes.len())
-    } else {
-        Ok(fastq_frame::line_start(
-            newline_offsets,
-            layout.complete_lines,
-        ))
+    Ok(bytes.len())
+}
+
+fn incomplete_or_truncated_frame(
+    eof: bool,
+    base_offset: u64,
+    record_start: usize,
+    record_index: u64,
+    line_index: u8,
+) -> Result<usize> {
+    if eof {
+        return Err(fastq_frame::format_at(
+            "truncated FASTQ record",
+            base_offset,
+            record_start,
+            record_index,
+            line_index,
+        ));
     }
+    Ok(record_start)
 }
 
 pub(super) fn visit_records_in_slab<F>(
@@ -153,6 +164,220 @@ where
     }
 
     Ok((bytes.len(), records))
+}
+
+#[inline]
+pub(super) fn count_records_in_slab(
+    bytes: &[u8],
+    eof: bool,
+    validate: bool,
+    base_offset: u64,
+    first_record_index: u64,
+    stats: &mut FastqStats,
+) -> Result<(usize, u64)> {
+    if validate {
+        return count_records_in_slab_impl::<true>(
+            bytes,
+            eof,
+            base_offset,
+            first_record_index,
+            stats,
+        );
+    }
+    count_records_in_slab_impl::<false>(bytes, eof, base_offset, first_record_index, stats)
+}
+
+#[inline]
+fn count_records_in_slab_impl<const VALIDATE: bool>(
+    bytes: &[u8],
+    eof: bool,
+    base_offset: u64,
+    first_record_index: u64,
+    stats: &mut FastqStats,
+) -> Result<(usize, u64)> {
+    let mut cursor = 0;
+    let mut records = 0_u64;
+    let mut newlines = memchr::memchr_iter(b'\n', bytes);
+
+    while cursor < bytes.len() {
+        let record_start = cursor;
+
+        let name_start = cursor;
+        let Some(name_raw_end) = newlines.next() else {
+            if eof && name_start < bytes.len() {
+                return incomplete_or_truncated_visit(
+                    eof,
+                    base_offset,
+                    record_start,
+                    first_record_index + records,
+                    records,
+                    1,
+                );
+            }
+            return Ok((record_start, records));
+        };
+        let name_end = fastq_frame::trim_cr_end(bytes, name_start, name_raw_end);
+
+        let seq_start = name_raw_end + 1;
+        let Some(seq_raw_end) = newlines.next() else {
+            if eof && seq_start < bytes.len() {
+                return incomplete_or_truncated_visit(
+                    eof,
+                    base_offset,
+                    record_start,
+                    first_record_index + records,
+                    records,
+                    2,
+                );
+            }
+            return incomplete_or_truncated_visit(
+                eof,
+                base_offset,
+                record_start,
+                first_record_index + records,
+                records,
+                1,
+            );
+        };
+        let seq_end = fastq_frame::trim_cr_end(bytes, seq_start, seq_raw_end);
+
+        let plus_start = seq_raw_end + 1;
+        let Some(plus_raw_end) = newlines.next() else {
+            if eof && plus_start < bytes.len() {
+                return incomplete_or_truncated_visit(
+                    eof,
+                    base_offset,
+                    record_start,
+                    first_record_index + records,
+                    records,
+                    3,
+                );
+            }
+            return incomplete_or_truncated_visit(
+                eof,
+                base_offset,
+                record_start,
+                first_record_index + records,
+                records,
+                2,
+            );
+        };
+        let qual_start = plus_raw_end + 1;
+        let qual_raw_end = if let Some(end) = newlines.next() {
+            cursor = end + 1;
+            end
+        } else if eof && qual_start < bytes.len() {
+            cursor = bytes.len();
+            bytes.len()
+        } else {
+            return incomplete_or_truncated_visit(
+                eof,
+                base_offset,
+                record_start,
+                first_record_index + records,
+                records,
+                3,
+            );
+        };
+        let qual_end = fastq_frame::trim_cr_end(bytes, qual_start, qual_raw_end);
+
+        if VALIDATE {
+            let record_index = first_record_index + records;
+            validate_count_record(
+                bytes,
+                CountRecordRanges {
+                    name_start,
+                    seq_start,
+                    seq_end,
+                    plus_start,
+                    qual_start,
+                    qual_end,
+                },
+                base_offset,
+                record_index,
+            )?;
+        }
+
+        let seq_len = (seq_end - seq_start) as u64;
+        let seq_first = if seq_start < seq_end {
+            bytes[seq_start]
+        } else {
+            0
+        };
+        stats.records += 1;
+        stats.bases += seq_len;
+        stats.qualities += (qual_end - qual_start) as u64;
+        stats.name_bytes += (name_end - name_start) as u64;
+        stats.checksum = stats
+            .checksum
+            .wrapping_add(seq_first as u64)
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(seq_len);
+        records += 1;
+    }
+
+    Ok((bytes.len(), records))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CountRecordRanges {
+    name_start: usize,
+    seq_start: usize,
+    seq_end: usize,
+    plus_start: usize,
+    qual_start: usize,
+    qual_end: usize,
+}
+
+#[inline(always)]
+fn validate_count_record(
+    bytes: &[u8],
+    ranges: CountRecordRanges,
+    base_offset: u64,
+    record_index: u64,
+) -> Result<()> {
+    if bytes.get(ranges.name_start) != Some(&b'@') {
+        return Err(fastq_frame::format_at(
+            "header must start with `@`",
+            base_offset,
+            ranges.name_start,
+            record_index,
+            0,
+        ));
+    }
+    match bytes.get(ranges.name_start + 1) {
+        Some(byte) if !byte.is_ascii_whitespace() => {}
+        _ => {
+            return Err(fastq_frame::format_at(
+                "empty FASTQ id",
+                base_offset,
+                ranges.name_start,
+                record_index,
+                0,
+            ));
+        }
+    }
+    if bytes.get(ranges.plus_start) != Some(&b'+') {
+        return Err(fastq_frame::format_at(
+            "plus line must start with `+`",
+            base_offset,
+            ranges.plus_start,
+            record_index,
+            2,
+        ));
+    }
+    let seq_len = ranges.seq_end - ranges.seq_start;
+    let qual_len = ranges.qual_end - ranges.qual_start;
+    if seq_len != qual_len {
+        return Err(fastq_frame::format_at(
+            format!("quality length {qual_len} != sequence length {seq_len}"),
+            base_offset,
+            ranges.qual_start,
+            record_index,
+            3,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,6 +479,7 @@ where
     Ok((bytes.len(), records, bases, false))
 }
 
+#[inline(always)]
 fn next_visit_line_bounds(
     bytes: &[u8],
     cursor: &mut usize,

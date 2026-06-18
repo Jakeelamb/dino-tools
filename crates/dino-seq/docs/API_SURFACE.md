@@ -12,12 +12,13 @@ These APIs are the default entry points for downstream scientific tools.
 | API | Role | 0.1.x decision |
 | --- | --- | --- |
 | `FastqReader` | Borrowed batch reader over any `Read` source | Keep public |
+| `FastqReader::count_records`, `count_fastq_read`, `count_fastq_bytes`, `FastqStats` | FASTQ count/total-bases/light-checksum paths without record view construction | Keep public |
 | `FastqReader::visit_records`, `FastqVisitRecord` | Single-pass streaming visitor without batch side-table construction | Keep public |
 | `FastqReader::next_chunk_with_sink`, `FastqRecordSink`, `FastqChunkSinkExt`, `FastqChunkConfig`, `FastqChunkStats` | Resumable chunk visitor for callers that fill their own output buffers and should not pay for Dino Seq batch side tables | Keep public |
 | `visit_fastq_bytes` | Zero-copy visitor for complete resident FASTQ byte buffers | Keep public |
 | `FastqBatch`, `FastqRecord`, `RecordRef` | Zero-copy record access within a reusable slab | Keep public |
 | `FastqConfig` | Slab size, validation, and pairing configuration | Keep public |
-| `open_fastq`, `open_fastq_with_config` | File-path opener for raw, gzip, and BGZF inputs | Keep public |
+| `open_fastq`, `open_fastq_with_config` | Convenience boxed file opener; raw by default, gzip/BGZF detection behind features | Keep public but do not steer raw hot paths here |
 | `FastaReader`, `FastaBatch`, `FastaRecord`, `FastaRecordRef` | Streaming multiline FASTA batches over any `Read` source | Keep public |
 | `FastaConfig` | FASTA batch, input-buffer, and sequence-length hint configuration | Keep public |
 | `FastaConfig::reference` | Named parser tuning for chromosome-scale reference FASTA records | Keep public |
@@ -27,16 +28,14 @@ These APIs are the default entry points for downstream scientific tools.
 | `FastaReader::stats`, `count_fasta_read`, `count_fasta_bytes`, `FastaStats` | Robust multiline FASTA count/total-bases/light-checksum paths | Keep public |
 | `count_two_line_fasta_bytes`, `count_two_line_fasta_read` | Strict two-line FASTA count/total-bases/light-checksum fast paths | Keep public |
 | `FastaRecordSink`, `FastaVisitRecord` | Borrowed FASTA visitor sink and record view | Keep public |
-| `FastaBatchSource` | Generic FASTA batch adapter for downstream pipelines | Keep public |
 | `OwnedFastaBatch`, `OwnedFastaRecord` | Transferable owned FASTA batches derived from borrowed parser slabs | Keep public |
-| `open_fasta`, `open_fasta_with_config` | File-path opener for raw, gzip, and BGZF FASTA inputs | Keep public |
+| `open_fasta`, `open_fasta_with_config` | Convenience boxed file opener; raw by default, gzip/BGZF detection behind features | Keep public but do not steer raw hot paths here |
 | `open_fasta_for_reference` | File-path opener using `FastaConfig::reference` for long reference records | Keep public |
 | `open_fastq_gzip_libdeflate*`, `open_fasta_gzip_libdeflate*`, `LibdeflateGzipLimits` | Explicit bounded buffered single-member gzip openers through the third-party `libdeflater` wrapper | Keep public behind `gzip` + `libdeflate` |
 | `PairedFastqReader`, `PairedFastqBatch`, `FastqPair` | Ordered paired-end streaming | Keep public |
 | `open_paired_fastq*` | Paired file opener variants | Keep public |
 | `PairingMode`, `PairValidation`, `strip_pair_suffix` | Explicit ordered-pair validation semantics | Keep public |
 | `FastqError`, `FastqPosition`, `Result` | Typed error reporting | Keep public |
-| `FastqBatchSource`, `FastqPairBatchSource` | Generic FASTQ adapters for downstream pipelines | Keep public |
 
 Rationale: these are the crate's core value proposition. They expose borrowed
 FASTQ and FASTA batches without imposing a workflow, allocator, or owned record
@@ -44,24 +43,25 @@ model.
 
 Performance-sensitive downstream integrations should use the narrowest surface
 that matches the work they actually need. Batch APIs are for callers that need
-record side tables. `visit_records` is for whole-stream one-pass consumers.
-`next_chunk_with_sink` is for pipeline stages such as aligners that need
-bounded chunks in caller-owned output structures and should not pay for
-intermediate owned records or a Dino Seq batch table. If a sink returns an
-error, the reader returns that error immediately and should be dropped rather
-than reused, because the sink may already contain records from the partial
-chunk.
+record side tables. `count_records` and `count_fastq_*` are for count/stat
+consumers that do not need record views. `visit_records` is for whole-stream
+one-pass consumers. `next_chunk_with_sink` is for pipeline stages such as
+aligners that need bounded chunks in caller-owned output structures and should
+not pay for intermediate owned records or a Dino Seq batch table. If a sink
+returns an error, the reader returns that error immediately and should be
+dropped rather than reused, because the sink may already contain records from
+the partial chunk.
 
 `FastqChunkConfig` and `FastqChunkStats` are marked non-exhaustive and expose
 accessors so downstream tools do not need to construct or destructure them by
 field. The `examples/fastq_chunk_sink.rs` example shows the intended adoption
 shape for filling owned downstream records while reusing caller allocations.
 
-Compression backends are not owned by dino_seq. `flate2` is configured for
-its pure-Rust backend by default, and `libdeflate` remains an explicit
-third-party C-backed opt-in through the `libdeflater` wrapper. Dino Seq owns
-the parser APIs, BGZF orchestration, backend-selection surface, and benchmark
-labels around those engines.
+Compression backends are not owned by dino_seq. The default crate has no
+compression dependency. `gzip`, `bgzf`, and `transport` are explicit opt-ins,
+and `libdeflate` remains a third-party C-backed opt-in through the
+`libdeflater` wrapper. Dino Seq owns the parser APIs, BGZF orchestration,
+backend-selection surface, and benchmark labels around those engines.
 
 ## Tier 2: Advanced But Intentional Surface
 
@@ -108,15 +108,16 @@ auto-detection.
 | `IndexedFastaReader::reference_chunks`, `BgzfIndexedFastaReader::reference_chunks` | Chunked owned sequence iteration over zero-based half-open reference ranges | Keep public |
 | `IndexedFastaReader::reference_chunks_into`, `BgzfIndexedFastaReader::reference_chunks_into` | Borrowed chunk streaming into caller-owned buffers | Keep public |
 | `IndexedFastaReader::fetch_partition`, `BgzfIndexedFastaReader::fetch_partition` | Fetch planned `FastaPartition` ranges as owned `FastaReferenceChunk` values | Keep public |
-| `visit_fastq_mmap`, `visit_fasta_mmap`, `count_fasta_mmap` | Optional resident file visitors behind `mmap` | Keep public behind feature |
+| `visit_fastq_mmap`, `count_fastq_mmap`, `visit_fasta_mmap`, `count_fasta_mmap` | Optional resident file visitors and counters behind `mmap` | Keep public behind feature |
 | `open_fastq_bgzf_*` | Explicit BGZF openers for callers that need transport control | Keep public |
 | `compress_bgzf_parallel*`, `decompress_bgzf_parallel*` | Whole-buffer helpers for controlled conversions | Keep public, but not the main streaming path |
 
 Rationale: BGZF is common enough in bioinformatics that downstream users need
 explicit knobs for backend choice, seek/index behavior, and bounded parallelism.
-The public docs should continue to steer ordinary FASTQ consumers toward
-`open_fastq` and advanced users toward explicit BGZF APIs only when they need
-transport control.
+The public docs should steer raw performance consumers toward
+`FastqReader<File>` / `FastaReader<File>`, ordinary convenience consumers toward
+`open_fastq` / `open_fasta`, and advanced users toward explicit BGZF APIs only
+when they need transport control.
 
 ## Hidden Or Internal Surface
 
@@ -124,6 +125,11 @@ Internal parser scanners, slab framing helpers, benchmark helpers, and BGZF
 worker plumbing remain private. New public exports should be added only when a
 downstream caller can state a concrete use case that cannot be served by the
 existing batch, pack, or transport tiers.
+
+The previous generic `FastaBatchSource`, `FastqBatchSource`, and
+`FastqPairBatchSource` traits were removed before `0.1.0`. Each had one local
+implementation and added a public abstraction layer without improving the hot
+path.
 
 ## Risks To Revisit Before 1.0
 
@@ -169,8 +175,9 @@ existing batch, pack, or transport tiers.
 
 ## Release Decision
 
-For `0.1.0`, keep the current public surface. It is broad, but the breadth maps
-to real framework axes: parsing, ordered pairing, packed side channels, and
-BGZF transport. The release should avoid any claim that all public APIs are
-equally high level. README, rustdoc, and benchmark prose should keep directing
-typical users to the Tier 1 APIs.
+For `0.1.0`, keep the default crate centered on raw parsing. Compression,
+mmap, SIMD, and libdeflate are explicit features. The public surface is still
+broader than a parser-only crate because it includes pairing, packed side
+channels, indexing, and BGZF transport, but README, rustdoc, and benchmark
+prose should keep raw `FastqReader<File>` / `FastaReader<File>` paths as the
+performance story.

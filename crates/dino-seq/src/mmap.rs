@@ -6,8 +6,8 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::{
-    FastaStats, FastaVisitRecord, FastqConfig, FastqVisitRecord, Result, count_fasta_bytes,
-    visit_fasta_bytes, visit_fastq_bytes,
+    FastaStats, FastaVisitRecord, FastqConfig, FastqStats, FastqVisitRecord, Result,
+    count_fasta_bytes, count_fastq_bytes, visit_fasta_bytes, visit_fastq_bytes,
 };
 
 /// Visit FASTQ records from a memory-mapped file.
@@ -20,6 +20,12 @@ where
 {
     let map = map_file(path)?;
     visit_fastq_bytes(&map, config, visit)
+}
+
+/// Count FASTQ records and bases from a memory-mapped file.
+pub fn count_fastq_mmap(path: impl AsRef<Path>, config: FastqConfig) -> Result<FastqStats> {
+    let map = map_file(path)?;
+    count_fastq_bytes(&map, config)
 }
 
 /// Visit FASTA records from a memory-mapped file.
@@ -50,7 +56,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::{FastqConfig, count_fasta_bytes, visit_fasta_bytes, visit_fastq_bytes};
+    use crate::{
+        FastqConfig, count_fasta_bytes, count_fastq_bytes, visit_fasta_bytes, visit_fastq_bytes,
+    };
 
     fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -85,6 +93,10 @@ mod tests {
 
         assert_eq!(mmap_count, resident_count);
         assert_eq!(mmap_records, resident_records);
+        assert_eq!(
+            count_fastq_mmap(&path, FastqConfig::default()).unwrap(),
+            count_fastq_bytes(input, FastqConfig::default()).unwrap()
+        );
     }
 
     #[test]

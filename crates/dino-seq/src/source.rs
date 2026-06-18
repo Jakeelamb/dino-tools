@@ -100,16 +100,18 @@ pub fn detect_file_input_kind(path: impl AsRef<Path>) -> Result<DetectedInputKin
 
 /// Open a FASTQ file with default configuration.
 ///
-/// With default features, this detects raw FASTQ, ordinary gzip, and BGZF by
-/// file magic. BGZF is checked before ordinary gzip.
+/// With default features, this opens raw FASTQ. Enabling `gzip` and/or `bgzf`
+/// adds file-magic transport detection. BGZF is checked before ordinary gzip
+/// when both features are enabled.
 pub fn open_fastq(path: impl AsRef<Path>) -> Result<FastqReader<Box<dyn Read + Send>>> {
     open_fastq_with_config(path, FastqConfig::default())
 }
 
 /// Open a FASTQ file with explicit parser configuration.
 ///
-/// This is the primary file-path API for callers that want format
-/// auto-detection with custom validation, slab, or pairing settings.
+/// This is the convenience file-path API for callers that want boxed transport
+/// detection with custom validation, slab, or pairing settings. Use
+/// `FastqReader<File>` directly for raw-file hot paths.
 pub fn open_fastq_with_config(
     path: impl AsRef<Path>,
     config: FastqConfig,
@@ -120,13 +122,17 @@ pub fn open_fastq_with_config(
 
 /// Open a FASTA file with default configuration.
 ///
-/// With default features, this detects raw FASTA, ordinary gzip, and BGZF by
-/// file magic. BGZF is checked before ordinary gzip.
+/// With default features, this opens raw FASTA. Enabling `gzip` and/or `bgzf`
+/// adds file-magic transport detection. BGZF is checked before ordinary gzip
+/// when both features are enabled.
 pub fn open_fasta(path: impl AsRef<Path>) -> Result<FastaReader<Box<dyn Read + Send>>> {
     open_fasta_with_config(path, FastaConfig::default())
 }
 
 /// Open a FASTA file with explicit parser configuration.
+///
+/// This is the convenience file-path API for callers that want boxed transport
+/// detection. Use `FastaReader<File>` directly for raw-file hot paths.
 pub fn open_fasta_with_config(
     path: impl AsRef<Path>,
     config: FastaConfig,

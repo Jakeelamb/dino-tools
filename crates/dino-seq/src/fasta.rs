@@ -658,22 +658,38 @@ fn copy_indexed_sequence_window<R: Read>(
         let take = usize::try_from(len.min(scratch.len() as u64))
             .map_err(|_| FastqError::Format("FASTA fetch span exceeds usize range".into()))?;
         reader.read_exact(&mut scratch[..take])?;
-        for &byte in &scratch[..take] {
-            let rel = physical_offset.checked_sub(entry.offset).ok_or_else(|| {
-                FastqError::Format("FASTA index physical offset precedes sequence offset".into())
-            })?;
-            if rel % entry.line_width < entry.line_bases {
-                out.push(byte);
-                if out.len() > expected_bases {
-                    return Err(FastqError::Format(
-                        "FASTA fetch produced more bases than expected".into(),
-                    ));
-                }
-            }
-            physical_offset = physical_offset.checked_add(1).ok_or_else(|| {
+        let mut cursor = 0;
+        while cursor < take {
+            let cursor_offset = physical_offset.checked_add(cursor as u64).ok_or_else(|| {
                 FastqError::Format("FASTA fetch physical offset overflowed".into())
             })?;
+            let rel = cursor_offset.checked_sub(entry.offset).ok_or_else(|| {
+                FastqError::Format("FASTA index physical offset precedes sequence offset".into())
+            })?;
+            let in_line = rel % entry.line_width;
+            let remaining = take - cursor;
+            if in_line >= entry.line_bases {
+                let skip = (entry.line_width - in_line).min(remaining as u64);
+                cursor += usize::try_from(skip).map_err(|_| {
+                    FastqError::Format("FASTA fetch span exceeds usize range".into())
+                })?;
+                continue;
+            }
+
+            let run = (entry.line_bases - in_line).min(remaining as u64);
+            let run = usize::try_from(run)
+                .map_err(|_| FastqError::Format("FASTA fetch span exceeds usize range".into()))?;
+            out.extend_from_slice(&scratch[cursor..cursor + run]);
+            if out.len() > expected_bases {
+                return Err(FastqError::Format(
+                    "FASTA fetch produced more bases than expected".into(),
+                ));
+            }
+            cursor += run;
         }
+        physical_offset = physical_offset
+            .checked_add(take as u64)
+            .ok_or_else(|| FastqError::Format("FASTA fetch physical offset overflowed".into()))?;
         len -= take as u64;
     }
     if out.len() != expected_bases {
@@ -1428,8 +1444,112 @@ impl<R: Read> FastaReader<R> {
 /// Unlike [`count_two_line_fasta_read`], this accepts wrapped/multiline FASTA
 /// using the robust [`FastaReader`] parser.
 pub fn count_fasta_read<R: Read>(reader: R) -> Result<FastaStats> {
-    let mut reader = FastaReader::new(reader);
-    reader.stats()
+    let mut reader = BufReader::with_capacity(DEFAULT_READER_BUFFER_SIZE, reader);
+    count_fasta_bufread(&mut reader)
+}
+
+fn count_fasta_bufread<R: BufRead>(reader: &mut R) -> Result<FastaStats> {
+    let mut scanner = FastaCountScanner::default();
+    let mut carry = Vec::new();
+    let mut carry_start = 0_u64;
+    let mut byte_offset = 0_u64;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+
+        let mut consumed = 0;
+        while consumed < available.len() {
+            let line_start = byte_offset + consumed as u64;
+            let Some(relative_newline) = memchr(b'\n', &available[consumed..]) else {
+                if carry.is_empty() {
+                    carry_start = line_start;
+                }
+                carry.extend_from_slice(&available[consumed..]);
+                consumed = available.len();
+                break;
+            };
+
+            let line_end = consumed + relative_newline;
+            if carry.is_empty() {
+                scanner.observe_line(trim_line(&available[consumed..line_end]), line_start)?;
+            } else {
+                carry.extend_from_slice(&available[consumed..line_end]);
+                scanner.observe_line(trim_line(&carry), carry_start)?;
+                carry.clear();
+            }
+            consumed = line_end + 1;
+        }
+
+        reader.consume(consumed);
+        byte_offset += consumed as u64;
+    }
+
+    if !carry.is_empty() {
+        scanner.observe_line(trim_line(&carry), carry_start)?;
+    }
+
+    scanner.finish()
+}
+
+#[derive(Debug, Default)]
+struct FastaCountScanner {
+    stats: FastaStats,
+    in_record: bool,
+    record_bases: u64,
+    first_base: u8,
+    last_base: u8,
+    record_index: u64,
+}
+
+impl FastaCountScanner {
+    fn observe_line(&mut self, line: &[u8], line_start: u64) -> Result<()> {
+        if line.is_empty() {
+            return Ok(());
+        }
+
+        if line.starts_with(b">") {
+            self.finish_record();
+            validate_header(line, line_start, self.record_index)?;
+            self.in_record = true;
+            return Ok(());
+        }
+
+        if !self.in_record {
+            return Err(format_at(
+                "FASTA record header must start with `>`",
+                line_start,
+                self.record_index,
+            ));
+        }
+
+        if self.record_bases == 0 {
+            self.first_base = line[0];
+        }
+        self.last_base = line.last().copied().unwrap_or_default();
+        self.record_bases += line.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FastaStats> {
+        self.finish_record();
+        Ok(self.stats)
+    }
+
+    fn finish_record(&mut self) {
+        if !self.in_record {
+            return;
+        }
+        self.stats
+            .observe_sequence_parts(self.record_bases, self.first_base, self.last_base);
+        self.record_index += 1;
+        self.in_record = false;
+        self.record_bases = 0;
+        self.first_base = 0;
+        self.last_base = 0;
+    }
 }
 
 /// Count records and bases from resident FASTA bytes.
@@ -1437,12 +1557,16 @@ pub fn count_fasta_read<R: Read>(reader: R) -> Result<FastaStats> {
 /// This accepts ordinary wrapped/multiline FASTA and shares validation behavior
 /// with [`visit_fasta_bytes`].
 pub fn count_fasta_bytes(bytes: &[u8]) -> Result<FastaStats> {
-    let mut stats = FastaStats::default();
-    visit_fasta_bytes(bytes, |record| {
-        stats.observe_sequence(record.seq());
-        Ok(())
-    })?;
-    Ok(stats)
+    let mut scanner = FastaCountScanner::default();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        let line_start = cursor as u64;
+        let line = next_trimmed_line(bytes, &mut cursor);
+        scanner.observe_line(line, line_start)?;
+    }
+
+    scanner.finish()
 }
 
 /// Build a `.fai`-style index over an ordinary FASTA stream.

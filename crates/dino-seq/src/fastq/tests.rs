@@ -19,6 +19,33 @@ fn collect_records(input: &[u8], slab_size: usize) -> Result<Vec<(Vec<u8>, Vec<u
     Ok(out)
 }
 
+fn collect_stats_with_visitor(input: &[u8], slab_size: usize) -> Result<FastqStats> {
+    let mut reader = FastqReader::with_config(
+        input,
+        FastqConfig {
+            slab_size,
+            validate: true,
+            ..FastqConfig::default()
+        },
+    );
+    let mut stats = FastqStats::default();
+    reader.visit_records(|record| {
+        let seq_len = record.seq().len() as u64;
+        let seq_first = record.seq().first().copied().unwrap_or_default();
+        stats.records += 1;
+        stats.bases += seq_len;
+        stats.qualities += record.qual().len() as u64;
+        stats.name_bytes += record.name().len() as u64;
+        stats.checksum = stats
+            .checksum
+            .wrapping_add(seq_first as u64)
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(seq_len);
+        Ok(())
+    })?;
+    Ok(stats)
+}
+
 #[test]
 fn reads_single_batch() {
     let out = collect_records(b"@r1\nACGT\n+\nIIII\n@r2\nTGCA\n+\nJJJJ\n", 1024).unwrap();
@@ -75,6 +102,66 @@ fn visit_records_matches_batch_records_across_slab_carry() {
 }
 
 #[test]
+fn count_records_matches_visitor_across_slab_carry() {
+    let input = b"@r1\nACGT\n+\nIIII\n@r2\nTGCA\n+\nJJJJ\n@r3\nNN\n+\n!!";
+    let expected = collect_stats_with_visitor(input, 18).unwrap();
+    let mut reader = FastqReader::with_config(
+        &input[..],
+        FastqConfig {
+            slab_size: 18,
+            validate: true,
+            ..FastqConfig::default()
+        },
+    );
+
+    let stats = reader.count_records().unwrap();
+
+    assert_eq!(stats, expected);
+    assert_eq!(stats.records, 3);
+    assert_eq!(stats.bases, 10);
+    assert_eq!(stats.qualities, 10);
+    assert_eq!(stats.name_bytes, 9);
+}
+
+#[test]
+fn count_fastq_bytes_accepts_missing_final_newline() {
+    let input = b"@r1\nACGT\n+\nIIII";
+
+    let stats = count_fastq_bytes(input, FastqConfig::default()).unwrap();
+
+    assert_eq!(stats.records, 1);
+    assert_eq!(stats.bases, 4);
+    assert_eq!(stats.qualities, 4);
+}
+
+#[test]
+fn count_records_reports_truncated_eof() {
+    let mut reader = FastqReader::new(&b"@r1\nACGT\n+"[..]);
+    let err = reader.count_records().unwrap_err();
+
+    assert!(err.to_string().contains("truncated FASTQ record"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(0, 0, 3)));
+}
+
+#[test]
+fn count_records_rejects_bad_plus_line() {
+    let mut reader = FastqReader::new(&b"@r1\nACGT\n-\nIIII\n"[..]);
+    let err = reader.count_records().unwrap_err();
+
+    assert!(err.to_string().contains("plus line must start"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(9, 0, 2)));
+}
+
+#[test]
+fn count_records_rejects_quality_length_mismatch() {
+    let mut reader = FastqReader::new(&b"@r1\nACGT\n+\nIII\n"[..]);
+    let err = reader.count_records().unwrap_err();
+
+    assert!(err.to_string().contains("quality length 3"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(11, 0, 3)));
+}
+
+#[test]
 fn next_chunk_with_sink_stops_and_resumes_at_record_boundary() {
     let input = b"@r1\nAAAA\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n@r3\nGG\n+\n!!\n";
     let mut reader = FastqReader::with_config(
@@ -111,6 +198,12 @@ fn next_chunk_with_sink_stops_and_resumes_at_record_boundary() {
             bases: 8
         }
     );
+    assert_eq!(reader.base_offset, 0);
+    assert_eq!(reader.len, input.len());
+    assert_eq!(
+        reader.chunk_resume_start,
+        b"@r1\nAAAA\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n".len()
+    );
 
     let mut second = Vec::new();
     let second_stats = reader
@@ -136,6 +229,43 @@ fn next_chunk_with_sink_stops_and_resumes_at_record_boundary() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn next_batch_after_chunk_resume_reads_remaining_records() {
+    let input = b"@r1\nAAAA\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n@r3\nGGGG\n+\nHHHH\n";
+    let mut reader = FastqReader::with_config(
+        &input[..],
+        FastqConfig {
+            slab_size: 1024,
+            validate: true,
+            ..FastqConfig::default()
+        },
+    );
+    let mut first = Vec::new();
+
+    let first_stats = reader
+        .next_chunk_with_sink(FastqChunkConfig::new(4), &mut |record: FastqVisitRecord<
+            '_,
+        >| {
+            first.push(record.name().to_vec());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first, vec![b"@r1".to_vec()]);
+    assert_eq!(first_stats.records, 1);
+    assert!(reader.chunk_resume_start > 0);
+
+    let batch = reader.next_batch().unwrap().unwrap();
+    let remaining = batch
+        .records()
+        .map(|record| record.name().to_vec())
+        .collect::<Vec<_>>();
+
+    assert_eq!(remaining, vec![b"@r2".to_vec(), b"@r3".to_vec()]);
+    assert!(reader.next_batch().unwrap().is_none());
 }
 
 #[test]
@@ -256,11 +386,9 @@ fn visit_fastq_bytes_reports_truncated_eof() {
 #[test]
 fn frame_records_carries_partial_line_after_complete_record() {
     let input = b"@r1\nACGT\n+\nIIII\n@partial";
-    let mut newlines = Vec::new();
-    scan_newlines(input, &mut newlines);
     let mut records = Vec::new();
 
-    let next_start = frame_records(input, &newlines, false, true, 0, 0, &mut records).unwrap();
+    let next_start = frame_records(input, false, true, 0, 0, &mut records).unwrap();
 
     assert_eq!(records.len(), 1);
     assert_eq!(next_start, b"@r1\nACGT\n+\nIIII\n".len());

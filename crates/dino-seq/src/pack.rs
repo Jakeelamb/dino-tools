@@ -772,7 +772,7 @@ impl<R: Read> TrustedFastqLineReader<R> {
             Err(fastq_frame::format_at(
                 "truncated FASTQ record",
                 self.base_offset,
-                self.len,
+                record_start,
                 record_index,
                 line_index,
             ))
@@ -1295,7 +1295,7 @@ fn trusted_direct_line<'a>(
 }
 
 fn incomplete_or_truncated_direct(
-    input: &[u8],
+    _input: &[u8],
     context: SlabContext,
     record_start: usize,
     records: u64,
@@ -1305,7 +1305,7 @@ fn incomplete_or_truncated_direct(
         Err(fastq_frame::format_at(
             "truncated FASTQ record",
             context.base_offset,
-            input.len(),
+            record_start,
             context.first_record_index + records,
             line_index,
         ))

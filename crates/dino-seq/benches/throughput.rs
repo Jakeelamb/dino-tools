@@ -6,6 +6,7 @@ use dino_seq::{
 use std::env;
 use std::hint::black_box;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Instant;
 
 const RECORDS: usize = 50_000;
@@ -79,7 +80,7 @@ impl Case {
             Self::FastaIndexBuild => "fasta_index_build_wrapped",
             Self::FastaFetchIndexed => "fasta_fetch_indexed_wrapped",
             #[cfg(feature = "bgzf")]
-            Self::BgzfDecodeParse => "bgzf_parallel_decode_then_parse",
+            Self::BgzfDecodeParse => "bgzf_parallel_stream_parse",
         }
     }
 
@@ -99,7 +100,9 @@ impl Case {
             "fasta-index" | "fasta_index_build_wrapped" => Some(Self::FastaIndexBuild),
             "fasta-fetch" | "fasta_fetch_indexed_wrapped" => Some(Self::FastaFetchIndexed),
             #[cfg(feature = "bgzf")]
-            "bgzf" | "bgzf_parallel_decode_then_parse" => Some(Self::BgzfDecodeParse),
+            "bgzf" | "bgzf_parallel_stream_parse" | "bgzf_parallel_decode_then_parse" => {
+                Some(Self::BgzfDecodeParse)
+            }
             _ => None,
         }
     }
@@ -383,9 +386,9 @@ fn fasta_fetch_indexed_wrapped(input: &[u8], index: &FastaIndex, bases: usize) -
 }
 
 #[cfg(feature = "bgzf")]
-fn bgzf_parallel_decode_then_parse(encoded: &[u8]) -> BenchResult<u64> {
-    let decoded = dino_seq::decompress_bgzf_parallel(encoded, 4)?;
-    let mut reader = FastqReader::new(std::io::Cursor::new(decoded));
+fn bgzf_parallel_stream_parse(encoded: Arc<[u8]>) -> BenchResult<u64> {
+    let bgzf = dino_seq::BgzfParallelReader::new(Cursor::new(encoded), 4)?;
+    let mut reader = FastqReader::new(bgzf);
     Ok(consume_fastq(&mut reader)?.checksum)
 }
 
@@ -463,9 +466,9 @@ fn main() -> BenchResult<()> {
 
     #[cfg(feature = "bgzf")]
     if Case::BgzfDecodeParse.should_run(config.case) {
-        let encoded = dino_seq::compress_bgzf_parallel(&input, 4)?;
+        let encoded: Arc<[u8]> = dino_seq::compress_bgzf_parallel(&input, 4)?.into();
         run_case(Case::BgzfDecodeParse.name(), bytes, config.iters, || {
-            bgzf_parallel_decode_then_parse(&encoded)
+            bgzf_parallel_stream_parse(encoded.clone())
         })?;
     }
 

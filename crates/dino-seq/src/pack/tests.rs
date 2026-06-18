@@ -1,4 +1,5 @@
 use super::*;
+use crate::FastqPosition;
 
 #[test]
 fn reports_required_lengths() {
@@ -345,6 +346,32 @@ fn trusted_direct_stream_handles_slab_carry() {
 }
 
 #[test]
+fn trusted_direct_reports_truncated_record_start() {
+    let input = b"@r0\nAC\n+\nII\n@r1\nTG\n+";
+    let err = pack_trusted_fastq_direct(input, |_record| Ok(())).unwrap_err();
+
+    assert!(err.to_string().contains("truncated FASTQ record"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(12, 1, 3)));
+}
+
+#[test]
+fn trusted_direct_stream_reports_truncated_record_start_after_carry() {
+    let input = b"@r0\nACGTACGT\n+\nIIIIIIII\n@r1\nTG\n+";
+    let err = pack_trusted_fastq_read_direct(
+        &input[..],
+        FastqConfig {
+            slab_size: 16,
+            ..FastqConfig::default()
+        },
+        |_record| Ok(()),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("truncated FASTQ record"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(24, 1, 3)));
+}
+
+#[test]
 fn trusted_paired_fastq_validates_fast_slash_ids() {
     let r1 = b"@frag/1\nACGT\n+\nIIII\n";
     let r2 = b"@frag/2\nTGCA\n+\nIIII\n";
@@ -390,6 +417,26 @@ fn trusted_paired_fastq_streams_across_slab_carry() {
 }
 
 #[test]
+fn trusted_paired_fastq_reports_truncated_mate_record_start() {
+    let r1 = b"@frag0/1\nACGT\n+\nIIII\n@frag1/1\nTGCA\n+\nJJJJ\n";
+    let r2 = b"@frag0/2\nTGCA\n+\nIIII\n@frag1/2\nAC\n+";
+    let err = pack_trusted_paired_fastq_read(
+        &r1[..],
+        &r2[..],
+        FastqConfig {
+            slab_size: 16,
+            ..FastqConfig::default()
+        },
+        crate::PairValidation::FastSlash,
+        |_pair| Ok(()),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("truncated FASTQ record"));
+    assert_eq!(error_position(&err), Some(FastqPosition::new(21, 1, 3)));
+}
+
+#[test]
 fn trusted_paired_fastq_rejects_mismatched_ids() {
     let r1 = b"@frag-a/1\nACGT\n+\nIIII\n";
     let r2 = b"@frag-b/2\nTGCA\n+\nIIII\n";
@@ -431,4 +478,11 @@ fn reports_selected_pack_kernel() {
     ));
     #[cfg(not(feature = "simd"))]
     assert_eq!(selected_pack_kernel(), PackKernel::Scalar);
+}
+
+fn error_position(err: &FastqError) -> Option<FastqPosition> {
+    match err {
+        FastqError::FormatAt { position, .. } => Some(position.clone()),
+        _ => None,
+    }
 }

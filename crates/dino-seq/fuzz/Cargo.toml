@@ -7,9 +7,11 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
-dino-seq = { path = ".." }
+dino-seq = { path = "..", features = ["bgzf"] }
 
 [[bin]]
 name = "fastq_reader"

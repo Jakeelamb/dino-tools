@@ -413,9 +413,11 @@ where
 pub struct FastaReferenceChunks<'a, R> {
     reader: &'a mut IndexedFastaReader<R>,
     name: Vec<u8>,
+    entry: FastaIndexEntry,
     next_offset: u64,
     end: u64,
     chunk_bases: u64,
+    initialized: bool,
 }
 
 /// Iterator over owned chunks from a [`BgzfIndexedFastaReader`].
@@ -423,9 +425,11 @@ pub struct FastaReferenceChunks<'a, R> {
 pub struct BgzfFastaReferenceChunks<'a, R> {
     reader: &'a mut BgzfIndexedFastaReader<R>,
     name: Vec<u8>,
+    entry: FastaIndexEntry,
     next_offset: u64,
     end: u64,
     chunk_bases: u64,
+    initialized: bool,
 }
 
 impl<R: Read + Seek> Iterator for FastaReferenceChunks<'_, R> {
@@ -436,17 +440,45 @@ impl<R: Read + Seek> Iterator for FastaReferenceChunks<'_, R> {
             return None;
         }
         let start = self.next_offset;
-        let end = start.saturating_add(self.chunk_bases).min(self.end);
-        self.next_offset = end;
-        Some(
-            self.reader
-                .fetch(&self.name, start..end)
-                .map(|seq| FastaReferenceChunk {
+        if !self.initialized {
+            if let Err(err) =
+                seek_indexed_sequence_start(&mut self.reader.inner, &self.entry, start)
+            {
+                self.next_offset = self.end;
+                return Some(Err(err));
+            }
+            self.initialized = true;
+        }
+        let capacity = indexed_chunk_capacity(start, self.end, self.chunk_bases);
+        let mut seq = match capacity {
+            Ok(capacity) => Vec::with_capacity(capacity),
+            Err(err) => {
+                self.next_offset = self.end;
+                return Some(Err(err));
+            }
+        };
+        match read_next_indexed_sequence_chunk(
+            &mut self.reader.inner,
+            &self.entry,
+            start,
+            self.end,
+            self.chunk_bases,
+            &mut seq,
+            &mut self.reader.scratch,
+        ) {
+            Ok(next_offset) => {
+                self.next_offset = next_offset;
+                Some(Ok(FastaReferenceChunk {
                     name: self.name.clone(),
                     global_offset: start,
                     seq,
-                }),
-        )
+                }))
+            }
+            Err(err) => {
+                self.next_offset = self.end;
+                Some(Err(err))
+            }
+        }
     }
 }
 
@@ -459,17 +491,48 @@ impl<R: Read + Seek> Iterator for BgzfFastaReferenceChunks<'_, R> {
             return None;
         }
         let start = self.next_offset;
-        let end = start.saturating_add(self.chunk_bases).min(self.end);
-        self.next_offset = end;
-        Some(
-            self.reader
-                .fetch(&self.name, start..end)
-                .map(|seq| FastaReferenceChunk {
+        if !self.initialized {
+            if let Err(err) = seek_bgzf_indexed_sequence_start(
+                &mut self.reader.inner,
+                &self.reader.bgzf_index,
+                &self.entry,
+                start,
+            ) {
+                self.next_offset = self.end;
+                return Some(Err(err));
+            }
+            self.initialized = true;
+        }
+        let capacity = indexed_chunk_capacity(start, self.end, self.chunk_bases);
+        let mut seq = match capacity {
+            Ok(capacity) => Vec::with_capacity(capacity),
+            Err(err) => {
+                self.next_offset = self.end;
+                return Some(Err(err));
+            }
+        };
+        match read_next_indexed_sequence_chunk(
+            &mut self.reader.inner,
+            &self.entry,
+            start,
+            self.end,
+            self.chunk_bases,
+            &mut seq,
+            &mut self.reader.scratch,
+        ) {
+            Ok(next_offset) => {
+                self.next_offset = next_offset;
+                Some(Ok(FastaReferenceChunk {
                     name: self.name.clone(),
                     global_offset: start,
                     seq,
-                }),
-        )
+                }))
+            }
+            Err(err) => {
+                self.next_offset = self.end;
+                Some(Err(err))
+            }
+        }
     }
 }
 
@@ -701,6 +764,150 @@ fn copy_indexed_sequence_window<R: Read>(
     Ok(())
 }
 
+fn seek_indexed_sequence_start<R: Seek>(
+    reader: &mut R,
+    entry: &FastaIndexEntry,
+    seq_pos: u64,
+) -> Result<()> {
+    let offset = entry.sequence_offset(seq_pos)?;
+    reader.seek(SeekFrom::Start(offset))?;
+    Ok(())
+}
+
+#[cfg(feature = "bgzf")]
+fn seek_bgzf_indexed_sequence_start<R: Read + Seek>(
+    reader: &mut BgzfSeekReader<R>,
+    bgzf_index: &BgzfIndex,
+    entry: &FastaIndexEntry,
+    seq_pos: u64,
+) -> Result<()> {
+    let offset = entry.sequence_offset(seq_pos)?;
+    let virtual_offset = bgzf_index
+        .virtual_offset_for_uncompressed_offset(offset)?
+        .ok_or_else(|| FastqError::Bgzf("BGZF span offset is not indexed".into()))?;
+    reader.seek_virtual_offset(virtual_offset)?;
+    Ok(())
+}
+
+fn indexed_chunk_capacity(start: u64, end: u64, chunk_bases: u64) -> Result<usize> {
+    usize::try_from(end.saturating_sub(start).min(chunk_bases.max(1)))
+        .map_err(|_| FastqError::Format("FASTA chunk length exceeds usize range".into()))
+}
+
+fn read_next_indexed_sequence_chunk<R: Read>(
+    reader: &mut R,
+    entry: &FastaIndexEntry,
+    start: u64,
+    end: u64,
+    chunk_bases: u64,
+    out: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Result<u64> {
+    if entry.line_bases == 0 {
+        return Err(FastqError::Format(
+            "FASTA index entry has zero line_bases for non-empty range".into(),
+        ));
+    }
+    if entry.line_width < entry.line_bases {
+        return Err(FastqError::Format(
+            "FASTA index entry has line_width smaller than line_bases".into(),
+        ));
+    }
+
+    let chunk_end = start.saturating_add(chunk_bases.max(1)).min(end);
+    out.clear();
+    out.reserve(indexed_chunk_capacity(start, chunk_end, chunk_bases)?);
+
+    let mut pos = start;
+    while pos < chunk_end {
+        let in_line = pos % entry.line_bases;
+        let take = (chunk_end - pos).min(entry.line_bases - in_line);
+        read_exact_into_vec(reader, out, take)?;
+        pos += take;
+        if pos < end && pos.is_multiple_of(entry.line_bases) {
+            skip_indexed_separator(reader, entry.line_width - entry.line_bases, scratch)?;
+        }
+    }
+    Ok(pos)
+}
+
+fn read_exact_into_vec<R: Read>(reader: &mut R, out: &mut Vec<u8>, len: u64) -> Result<()> {
+    let len = usize::try_from(len)
+        .map_err(|_| FastqError::Format("FASTA sequence run exceeds usize range".into()))?;
+    let old_len = out.len();
+    out.resize(old_len + len, 0);
+    reader.read_exact(&mut out[old_len..])?;
+    Ok(())
+}
+
+fn skip_indexed_separator<R: Read>(
+    reader: &mut R,
+    mut len: u64,
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if scratch.len() < INDEXED_FETCH_SCRATCH_SIZE {
+        scratch.resize(INDEXED_FETCH_SCRATCH_SIZE, 0);
+    }
+    while len > 0 {
+        let take = usize::try_from(len.min(scratch.len() as u64))
+            .map_err(|_| FastqError::Format("FASTA separator span exceeds usize range".into()))?;
+        reader.read_exact(&mut scratch[..take])?;
+        len -= take as u64;
+    }
+    Ok(())
+}
+
+struct IndexedSequenceStream<'a, R> {
+    reader: &'a mut R,
+    scratch: &'a mut Vec<u8>,
+    entry: &'a FastaIndexEntry,
+    next_offset: u64,
+    end: u64,
+    chunk_bases: u64,
+}
+
+impl<R: Read> IndexedSequenceStream<'_, R> {
+    fn next_chunk_into(&mut self, out: &mut Vec<u8>) -> Result<Option<u64>> {
+        if self.next_offset >= self.end {
+            return Ok(None);
+        }
+        let start = self.next_offset;
+        self.next_offset = read_next_indexed_sequence_chunk(
+            self.reader,
+            self.entry,
+            start,
+            self.end,
+            self.chunk_bases,
+            out,
+            self.scratch,
+        )?;
+        Ok(Some(start))
+    }
+}
+
+fn stream_indexed_reference_chunks_into<R, S>(
+    stream: &mut IndexedSequenceStream<'_, R>,
+    name: &[u8],
+    out: &mut Vec<u8>,
+    sink: &mut S,
+) -> Result<()>
+where
+    R: Read,
+    S: FastaReferenceChunkSink,
+{
+    while let Some(start) = stream.next_chunk_into(out)? {
+        sink.chunk(FastaReferenceChunkRef {
+            name,
+            global_offset: start,
+            seq: out,
+        })?;
+    }
+    Ok(())
+}
+
 /// Seekable FASTA reader backed by a `.fai` index.
 pub struct IndexedFastaReader<R> {
     inner: R,
@@ -775,12 +982,15 @@ impl<R: Read + Seek> IndexedFastaReader<R> {
             ))
         })?;
         entry.validate_range(range.clone())?;
+        let entry = entry.clone();
         Ok(FastaReferenceChunks {
             reader: self,
             name: name.to_vec(),
+            entry,
             next_offset: range.start,
             end: range.end,
             chunk_bases: chunk_bases.max(1),
+            initialized: false,
         })
     }
 
@@ -807,9 +1017,18 @@ impl<R: Read + Seek> IndexedFastaReader<R> {
             ))
         })?;
         entry.validate_range(range.clone())?;
-        stream_reference_chunks_into(name, range, chunk_bases, out, sink, |name, range, out| {
-            self.fetch_into(name, range, out)
-        })
+        if range.start < range.end {
+            seek_indexed_sequence_start(&mut self.inner, entry, range.start)?;
+        }
+        let mut stream = IndexedSequenceStream {
+            reader: &mut self.inner,
+            scratch: &mut self.scratch,
+            entry,
+            next_offset: range.start,
+            end: range.end,
+            chunk_bases,
+        };
+        stream_indexed_reference_chunks_into(&mut stream, name, out, sink)
     }
 
     /// Fetch a planned partition into an owned reference chunk.
@@ -919,12 +1138,15 @@ impl<R: Read + Seek> BgzfIndexedFastaReader<R> {
             ))
         })?;
         entry.validate_range(range.clone())?;
+        let entry = entry.clone();
         Ok(BgzfFastaReferenceChunks {
             reader: self,
             name: name.to_vec(),
+            entry,
             next_offset: range.start,
             end: range.end,
             chunk_bases: chunk_bases.max(1),
+            initialized: false,
         })
     }
 
@@ -951,9 +1173,23 @@ impl<R: Read + Seek> BgzfIndexedFastaReader<R> {
             ))
         })?;
         entry.validate_range(range.clone())?;
-        stream_reference_chunks_into(name, range, chunk_bases, out, sink, |name, range, out| {
-            self.fetch_into(name, range, out)
-        })
+        if range.start < range.end {
+            seek_bgzf_indexed_sequence_start(
+                &mut self.inner,
+                &self.bgzf_index,
+                entry,
+                range.start,
+            )?;
+        }
+        let mut stream = IndexedSequenceStream {
+            reader: &mut self.inner,
+            scratch: &mut self.scratch,
+            entry,
+            next_offset: range.start,
+            end: range.end,
+            chunk_bases,
+        };
+        stream_indexed_reference_chunks_into(&mut stream, name, out, sink)
     }
 
     /// Fetch a planned partition into an owned reference chunk.
@@ -965,34 +1201,6 @@ impl<R: Read + Seek> BgzfIndexedFastaReader<R> {
                 seq,
             })
     }
-}
-
-fn stream_reference_chunks_into<S, F>(
-    name: &[u8],
-    range: Range<u64>,
-    chunk_bases: u64,
-    out: &mut Vec<u8>,
-    sink: &mut S,
-    mut fetch_into: F,
-) -> Result<()>
-where
-    S: FastaReferenceChunkSink,
-    F: FnMut(&[u8], Range<u64>, &mut Vec<u8>) -> Result<()>,
-{
-    let chunk_bases = chunk_bases.max(1);
-    let mut next_offset = range.start;
-    while next_offset < range.end {
-        let start = next_offset;
-        let end = start.saturating_add(chunk_bases).min(range.end);
-        next_offset = end;
-        fetch_into(name, start..end, out)?;
-        sink.chunk(FastaReferenceChunkRef {
-            name,
-            global_offset: start,
-            seq: out,
-        })?;
-    }
-    Ok(())
 }
 
 impl Default for FastaStats {

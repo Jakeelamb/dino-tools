@@ -1,4 +1,32 @@
 use super::*;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
+struct CountingCursor {
+    inner: Cursor<Vec<u8>>,
+    seeks: usize,
+}
+
+impl CountingCursor {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            inner: Cursor::new(bytes),
+            seeks: 0,
+        }
+    }
+}
+
+impl Read for CountingCursor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for CountingCursor {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.seeks += 1;
+        self.inner.seek(pos)
+    }
+}
 
 #[test]
 fn reads_multiline_fasta_records() {
@@ -481,9 +509,9 @@ fn parses_fai_and_fetches_wrapped_range() {
 
 #[test]
 fn streams_indexed_reference_chunks() {
-    let input = b">chr1\nACGT\nTGCA\nAA\n";
+    let input = b">chr1\nACGT\nTGCA\nAA\n".to_vec();
     let index = build_fasta_index(&input[..]).unwrap();
-    let mut reader = IndexedFastaReader::new(std::io::Cursor::new(input), index);
+    let mut reader = IndexedFastaReader::new(CountingCursor::new(input), index);
     let chunks = reader
         .reference_chunks(b"chr1", 2..10, 3)
         .unwrap()
@@ -510,13 +538,15 @@ fn streams_indexed_reference_chunks() {
             },
         ]
     );
+    let (inner, _) = reader.into_inner();
+    assert_eq!(inner.seeks, 1);
 }
 
 #[test]
 fn streams_indexed_reference_chunks_into_reused_buffer() {
-    let input = b">chr1\nACGT\nTGCA\nAA\n";
+    let input = b">chr1\nACGT\nTGCA\nAA\n".to_vec();
     let index = build_fasta_index(&input[..]).unwrap();
-    let mut reader = IndexedFastaReader::new(std::io::Cursor::new(input), index);
+    let mut reader = IndexedFastaReader::new(CountingCursor::new(input), index);
     let mut scratch = Vec::with_capacity(16);
     let scratch_ptr = scratch.as_ptr();
     let mut chunks = Vec::new();
@@ -551,6 +581,8 @@ fn streams_indexed_reference_chunks_into_reused_buffer() {
         ]
     );
     assert!(chunks.iter().all(|(_, _, _, ptr)| *ptr == scratch_ptr));
+    let (inner, _) = reader.into_inner();
+    assert_eq!(inner.seeks, 1);
 }
 
 #[test]

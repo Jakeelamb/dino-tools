@@ -4,3 +4,11 @@
 
 /dna/target/
 /crates/*/target/
+/lab/data/
+/lab/build-logs/
+/lab/indexes/
+/lab/prepared/
+/lab/runs/
+/lab/signatures/
+/lab/tools/
+/lab/tmp/

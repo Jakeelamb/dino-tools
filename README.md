@@ -31,5 +31,13 @@ cargo install --path dna
 cargo run -p dino-seq -- stats --help
 cargo run -p dino-quant -- demo
 cargo run -p dna --bin DNA -- --help
+scripts/quant-lab init
+scripts/quant-lab acquire all
+scripts/quant-lab prepare all
+scripts/quant-lab run-suite smoke
+scripts/quant-lab run quant_minimap2_assisted_cached_bundle_scale_ecoli
+scripts/quant-lab run quant_minimap2_assisted_bundle_optimizer_ecoli
+scripts/quant-lab run quant_minimap2_assisted_bundle_cold_warm_ecoli
+scripts/quant-lab summarize
 cargo test --workspace
 ```

@@ -1,0 +1,27 @@
+matrix_id	tool	stage	data_id	variant	threads	status	notes
+smoke_minimap2	minimap2	smoke	none	baseline	8	ready	version command only
+smoke_bowtie2	bowtie2	smoke	none	baseline	8	ready	version command only
+smoke_kraken2	kraken2	smoke	none	baseline	8	ready	version command only
+smoke_sourmash	sourmash	smoke	none	baseline	8	ready	version command only
+smoke_spades	spades	smoke	none	baseline	8	ready	version command only
+smoke_diamond	diamond	smoke	none	baseline	8	ready	version command only
+quant_sweep_ecoli	dino-quant	quant-prefilter	ecoli_mg1655_ref	4bit	8	ready	sweep-fasta on E. coli reference
+quant_candidates_ecoli	dino-quant	quant-prefilter	ecoli_srr001666_r1	4bit-10k	8	ready	emit read-to-reference candidates for first 10k reads
+quant_protein_ecoli	dino-quant	quant-prefilter	ecoli_mg1655_protein	4bit	8	ready	emit protein candidates against E. coli plus decoys
+quant_minimap2_parity_sweep_ecoli	dino-quant+minimap2	parity	ecoli_srr001666_r1	window-sweep-1k	8	ready	sweep dino-quant window sizes against minimap2 mappings for first 1k reads
+quant_minimap2_parity_ecoli_fullref	dino-quant+minimap2	parity	ecoli_srr001666_r1	top10-10k-fullref	8	ready	compare dino-quant candidate windows against minimap2 PAF mappings on full reference
+quant_retrieval_modes_ecoli	dino-quant+minimap2	parity	ecoli_srr001666_r1	retrieval-64bp-1k	8	ready	test minimizer SimHash MIH IVF and HNSW candidate retrieval against minimap2 mappings
+quant_minimap2_assisted_ecoli	dino-quant+minimap2	assisted-mapper	ecoli_srr001666_r1	minimizer-reduced-reference-10k	8	ready	map reads to dino-quant minimizer reduced reference and compare translated PAF parity
+quant_minimap2_assisted_cached_ecoli	dino-quant+minimap2	assisted-mapper	ecoli_srr001666_r1	cached-minimizer-mmi-10k	8	ready	map reads with cached dino-quant minimizer reduced reference index and compare translated PAF parity
+quant_minimap2_assisted_cached_scale_ecoli	dino-quant+minimap2	assisted-mapper	ecoli_srr001666_r1	cached-minimizer-mmi-scale	8	ready	compare cached full-reference and assisted masked minimap2 over multiple read counts
+quant_minimap2_assisted_cached_bundle_scale_ecoli	dino-quant+minimap2	assisted-mapper	ecoli_srr001666_r1	cached-minimizer-mmi-bundle-scale	8	ready	compare cached full bundled reference and assisted masked minimap2 over multiple read counts
+quant_minimap2_assisted_bundle_optimizer_ecoli	dino-quant+minimap2	optimize	ecoli_srr001666_r1	masked-bundle-optimizer	8	ready	sweep top-k candidate-limit padding and merge-gap to minimize the masked reference while preserving parity
+quant_minimap2_assisted_bundle_cold_warm_ecoli	dino-quant+minimap2	assisted-mapper	ecoli_srr001666_r1	cold-warm-bundle	8	ready	measure baseline mapper cold assisted build steps and warm assisted mapper time
+quant_dino_seq_chunk_sweep_candidates_bundle	dino-quant+minimap2	quant-prefilter	ecoli_srr001666_r1	dino-seq-chunk-sweep	8	ready	benchmark dino-seq FASTQ chunk sizes for dino-quant minimizer candidate generation on the bundled reference
+baseline_minimap2_ecoli	minimap2	baseline	ecoli_srr001666_r1	sr-10k	8	ready	short-read mapping to E. coli reference for first 10k reads
+baseline_minimap2_cached_ecoli	minimap2	baseline	ecoli_srr001666_r1	cached-sr-mmi-10k	8	ready	short-read mapping to cached E. coli minimap2 index for first 10k reads
+baseline_bowtie2_ecoli	bowtie2	baseline	ecoli_srr001666_r1	sensitive-10k	8	ready	short-read alignment to E. coli index for first 10k reads
+baseline_kraken2_ecoli	kraken2	baseline	ecoli_srr001666_r1	custom-mini	8	planned	requires prepared custom mini database
+baseline_sourmash_ecoli	sourmash	baseline	ecoli_mg1655_ref	containment	8	ready	search E. coli signature against decoys
+baseline_spades_ecoli	spades	baseline	ecoli_srr001666_r1	error-correction-10k	8	ready	SPAdes only-error-correction on first 10k paired reads
+baseline_diamond_ecoli	diamond	baseline	ecoli_mg1655_protein	blastp	8	ready	protein search against E. coli plus decoys

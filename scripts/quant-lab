@@ -1,0 +1,1454 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+lab_root="${DINO_QUANT_LAB_ROOT:-"$(dirname "$repo_root")/dino-quant-lab"}"
+bench_threads="${BENCH_THREADS:-8}"
+time_bin="${TIME_BIN:-/usr/bin/time}"
+
+usage() {
+  cat <<USAGE
+usage:
+  scripts/quant-lab init
+  scripts/quant-lab paths
+  scripts/quant-lab acquire DATA_ID|all
+  scripts/quant-lab prepare TOOL|all
+  scripts/quant-lab prepare-assisted-minimap2
+  scripts/quant-lab tune-assisted-minimap2-bundle
+  scripts/quant-lab run MATRIX_ID
+  scripts/quant-lab run-suite smoke|ready|all
+  scripts/quant-lab score-minimap2-candidates CANDIDATES_TSV MINIMAP2_PAF
+  scripts/quant-lab score-translated-paf BASELINE_PAF ASSISTED_PAF
+  scripts/quant-lab optimize-retrieval minimizer|simhash|mih|ivf|hnsw
+  scripts/quant-lab summarize
+  scripts/quant-lab new-run TOOL APP [VARIANT]
+USAGE
+}
+
+init_lab() {
+  mkdir -p \
+    "$lab_root/build-logs" \
+    "$lab_root/data/indexes" \
+    "$lab_root/data/prepared" \
+    "$lab_root/data/proteins" \
+    "$lab_root/data/reads" \
+    "$lab_root/data/refs" \
+    "$lab_root/data/signatures" \
+    "$lab_root/data/assisted" \
+    "$lab_root/patches" \
+    "$lab_root/runs" \
+    "$lab_root/tmp" \
+    "$lab_root/tools"
+  printf 'lab_root\t%s\n' "$lab_root"
+}
+
+dataset_field() {
+  local data_id="$1"
+  local field="$2"
+  awk -F '\t' -v id="$data_id" -v field="$field" '
+    NR == 1 {
+      for (idx = 1; idx <= NF; idx++) {
+        if ($idx == field) col = idx
+      }
+      next
+    }
+    $1 == id {
+      print $col
+      found = 1
+      exit
+    }
+    END {
+      if (!found) exit 1
+    }
+  ' "$repo_root/lab/datasets.tsv"
+}
+
+matrix_field() {
+  local matrix_id="$1"
+  local field="$2"
+  awk -F '\t' -v id="$matrix_id" -v field="$field" '
+    NR == 1 {
+      for (idx = 1; idx <= NF; idx++) {
+        if ($idx == field) col = idx
+      }
+      next
+    }
+    $1 == id {
+      print $col
+      found = 1
+      exit
+    }
+    END {
+      if (!found) exit 1
+    }
+  ' "$repo_root/lab/matrix.tsv"
+}
+
+dataset_path() {
+  local data_id="$1"
+  printf '%s/%s\n' "$lab_root" "$(dataset_field "$data_id" external_path)"
+}
+
+acquire_one() {
+  local data_id="$1"
+  local url
+  local expected_md5
+  local output
+  url="$(dataset_field "$data_id" url)"
+  expected_md5="$(dataset_field "$data_id" md5)"
+  output="$(dataset_path "$data_id")"
+  mkdir -p "$(dirname "$output")"
+  if [ ! -s "$output" ]; then
+    printf 'download\t%s\t%s\n' "$data_id" "$output"
+    curl -fL --retry 3 --retry-delay 2 -o "$output.tmp" "$url"
+    mv "$output.tmp" "$output"
+  else
+    printf 'exists\t%s\t%s\n' "$data_id" "$output"
+  fi
+  if [ "$expected_md5" != "-" ]; then
+    actual_md5="$(md5sum "$output" | awk '{print $1}')"
+    if [ "$actual_md5" != "$expected_md5" ]; then
+      printf 'md5_mismatch\t%s\texpected=%s\tactual=%s\n' "$data_id" "$expected_md5" "$actual_md5" >&2
+      exit 1
+    fi
+    printf 'md5_ok\t%s\t%s\n' "$data_id" "$actual_md5"
+  fi
+}
+
+acquire() {
+  local target="${1:?missing DATA_ID|all}"
+  init_lab >/dev/null
+  if [ "$target" = "all" ]; then
+    awk -F '\t' 'NR > 1 { print $1 }' "$repo_root/lab/datasets.tsv" |
+      while IFS= read -r data_id; do
+        acquire_one "$data_id"
+      done
+  else
+    acquire_one "$target"
+  fi
+}
+
+prepare_reference_bundle() {
+  local output="$lab_root/data/prepared/genomes.fna"
+  acquire ecoli_mg1655_ref >/dev/null
+  acquire salmonella_lt2_ref >/dev/null
+  acquire bacillus_168_ref >/dev/null
+  acquire pseudomonas_pao1_ref >/dev/null
+  mkdir -p "$(dirname "$output")"
+  gzip -dc \
+    "$(dataset_path ecoli_mg1655_ref)" \
+    "$(dataset_path salmonella_lt2_ref)" \
+    "$(dataset_path bacillus_168_ref)" \
+    "$(dataset_path pseudomonas_pao1_ref)" > "$output.tmp"
+  mv "$output.tmp" "$output"
+  printf 'prepared\tgenomes\t%s\n' "$output"
+}
+
+prepare_protein_bundle() {
+  local output="$lab_root/data/prepared/proteins.faa"
+  mkdir -p "$(dirname "$output")"
+  gzip -dc \
+    "$(dataset_path ecoli_mg1655_protein)" \
+    "$(dataset_path salmonella_lt2_protein)" \
+    "$(dataset_path bacillus_168_protein)" > "$output.tmp"
+  mv "$output.tmp" "$output"
+  printf 'prepared\tproteins\t%s\n' "$output"
+}
+
+prepare_read_slices() {
+  acquire ecoli_srr001666_r1 >/dev/null
+  acquire ecoli_srr001666_r2 >/dev/null
+  mkdir -p "$lab_root/data/prepared"
+  if [ ! -s "$lab_root/data/prepared/SRR001666_1.10k.fastq" ]; then
+    gzip -dc "$(dataset_path ecoli_srr001666_r1)" |
+      awk 'NR <= 40000 { print }' > "$lab_root/data/prepared/SRR001666_1.10k.fastq.tmp"
+    mv "$lab_root/data/prepared/SRR001666_1.10k.fastq.tmp" "$lab_root/data/prepared/SRR001666_1.10k.fastq"
+  fi
+  if [ ! -s "$lab_root/data/prepared/SRR001666_2.10k.fastq" ]; then
+    gzip -dc "$(dataset_path ecoli_srr001666_r2)" |
+      awk 'NR <= 40000 { print }' > "$lab_root/data/prepared/SRR001666_2.10k.fastq.tmp"
+    mv "$lab_root/data/prepared/SRR001666_2.10k.fastq.tmp" "$lab_root/data/prepared/SRR001666_2.10k.fastq"
+  fi
+  printf 'prepared\treads_10k\t%s\t%s\n' \
+    "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+    "$lab_root/data/prepared/SRR001666_2.10k.fastq"
+}
+
+prepare_one() {
+  local tool="$1"
+  init_lab >/dev/null
+  case "$tool" in
+    minimap2)
+      acquire ecoli_mg1655_ref >/dev/null
+      mkdir -p "$lab_root/data/indexes/minimap2"
+      "$lab_root/tools/minimap2/minimap2" -x sr -d \
+        "$lab_root/data/indexes/minimap2/ecoli_mg1655.sr.mmi" \
+        "$(dataset_path ecoli_mg1655_ref)"
+      ;;
+    bowtie2)
+      acquire ecoli_mg1655_ref >/dev/null
+      mkdir -p "$lab_root/data/indexes/bowtie2"
+      gzip -dc "$(dataset_path ecoli_mg1655_ref)" > "$lab_root/data/prepared/ecoli_mg1655.fna"
+      "$lab_root/tools/bowtie2/bowtie2-build" --threads "$bench_threads" \
+        "$lab_root/data/prepared/ecoli_mg1655.fna" \
+        "$lab_root/data/indexes/bowtie2/ecoli_mg1655"
+      ;;
+    sourmash)
+      acquire ecoli_mg1655_ref >/dev/null
+      acquire salmonella_lt2_ref >/dev/null
+      acquire bacillus_168_ref >/dev/null
+      acquire pseudomonas_pao1_ref >/dev/null
+      mkdir -p "$lab_root/data/signatures"
+      "$lab_root/tools/sourmash/.venv/bin/sourmash" compute -k 31 --scaled 1000 \
+        -o "$lab_root/data/signatures/genomes.sig" \
+        "$(dataset_path ecoli_mg1655_ref)" \
+        "$(dataset_path salmonella_lt2_ref)" \
+        "$(dataset_path bacillus_168_ref)" \
+        "$(dataset_path pseudomonas_pao1_ref)"
+      "$lab_root/tools/sourmash/.venv/bin/sourmash" compute -k 31 --scaled 1000 \
+        -o "$lab_root/data/signatures/ecoli_mg1655.sig" \
+        "$(dataset_path ecoli_mg1655_ref)"
+      ;;
+    diamond)
+      acquire ecoli_mg1655_protein >/dev/null
+      acquire salmonella_lt2_protein >/dev/null
+      acquire bacillus_168_protein >/dev/null
+      prepare_protein_bundle >/dev/null
+      mkdir -p "$lab_root/data/indexes/diamond"
+      "$lab_root/tools/diamond/build/diamond" makedb \
+        --threads "$bench_threads" \
+        --in "$lab_root/data/prepared/proteins.faa" \
+        --db "$lab_root/data/indexes/diamond/proteins"
+      ;;
+    spades)
+      prepare_read_slices
+      printf 'prepared\tspades\tuses prepared 10k FASTQ inputs\n'
+      ;;
+    reads)
+      prepare_read_slices
+      ;;
+    kraken2)
+      printf 'planned\tkraken2\tcustom taxonomy/database build is intentionally not automatic in the first slice\n'
+      ;;
+    all)
+      prepare_one minimap2
+      prepare_one bowtie2
+      prepare_one sourmash
+      prepare_one diamond
+      prepare_one reads
+      prepare_one spades
+      prepare_one kraken2
+      ;;
+    *)
+      printf 'unknown tool for prepare: %s\n' "$tool" >&2
+      exit 2
+      ;;
+  esac
+}
+
+new_run() {
+  local tool="${1:?missing TOOL}"
+  local app="${2:?missing APP}"
+  local variant="${3:-trial}"
+  local stamp
+  local run_id
+  local run_dir
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  run_id="${stamp}-${tool}-${app}-${variant}"
+  run_dir="$lab_root/runs/$run_id"
+  mkdir -p "$run_dir"
+  printf 'run_id\t%s\n' "$run_id"
+  printf 'output_dir\t%s\n' "$run_dir"
+}
+
+run_timed() {
+  local run_dir="$1"
+  shift
+  printf '%s\n' "$*" > "$run_dir/command.txt"
+  if [ -x "$time_bin" ]; then
+    "$time_bin" -v -o "$run_dir/time.txt" "$@" > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
+  else
+    "$@" > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
+  fi
+}
+
+score_minimap2_candidates() {
+  local candidates_tsv="${1:?missing CANDIDATES_TSV}"
+  local minimap2_paf="${2:?missing MINIMAP2_PAF}"
+  awk -F '\t' '
+    FILENAME == ARGV[1] {
+      if (FNR == 1) next
+      query = $1
+      rank = $3 + 0
+      candidate_query[query] = 1
+      if (rank > 20) next
+      idx = ++candidate_count[query]
+      candidate_rank[query, idx] = rank
+      candidate_target[query, idx] = $4
+      candidate_start[query, idx] = $5 + 0
+      candidate_end[query, idx] = $6 + 0
+      next
+    }
+    FILENAME == ARGV[2] {
+      if (NF < 12) next
+      alignments += 1
+      query = $1
+      aligned_query[query] = 1
+      if (!candidate_query[query]) {
+        mapped_without_candidates[query] = 1
+        next
+      }
+      target = $6
+      align_start = $8 + 0
+      align_end = $9 + 0
+      for (idx = 1; idx <= candidate_count[query]; idx++) {
+        if (candidate_target[query, idx] != target) continue
+        if (align_end <= candidate_start[query, idx]) continue
+        if (align_start >= candidate_end[query, idx]) continue
+        rank = candidate_rank[query, idx]
+        if (rank <= 1) top1[query] = 1
+        if (rank <= 5) top5[query] = 1
+        if (rank <= 10) top10[query] = 1
+        if (rank <= 20) top20[query] = 1
+      }
+      scored_query[query] = 1
+      next
+    }
+    END {
+      for (query in candidate_query) {
+        candidate_queries += 1
+      }
+      for (query in aligned_query) {
+        mapped_queries += 1
+      }
+      for (query in mapped_without_candidates) {
+        unscored_mapped_queries += 1
+      }
+      for (query in scored_query) {
+        scored_mapped_queries += 1
+        top1_hits += top1[query]
+        top5_hits += top5[query]
+        top10_hits += top10[query]
+        top20_hits += top20[query]
+      }
+      printf "metric\tvalue\n"
+      printf "candidate_queries\t%d\n", candidate_queries
+      printf "alignments\t%d\n", alignments
+      printf "mapped_queries\t%d\n", mapped_queries
+      printf "scored_mapped_queries\t%d\n", scored_mapped_queries
+      printf "unscored_mapped_queries\t%d\n", unscored_mapped_queries
+      printf "top1_hits\t%d\n", top1_hits
+      printf "top5_hits\t%d\n", top5_hits
+      printf "top10_hits\t%d\n", top10_hits
+      printf "top20_hits\t%d\n", top20_hits
+      if (scored_mapped_queries > 0) {
+        printf "top1_recall\t%.6f\n", top1_hits / scored_mapped_queries
+        printf "top5_recall\t%.6f\n", top5_hits / scored_mapped_queries
+        printf "top10_recall\t%.6f\n", top10_hits / scored_mapped_queries
+        printf "top20_recall\t%.6f\n", top20_hits / scored_mapped_queries
+      } else {
+        printf "top1_recall\tNA\n"
+        printf "top5_recall\tNA\n"
+        printf "top10_recall\tNA\n"
+        printf "top20_recall\tNA\n"
+      }
+    }
+  ' "$candidates_tsv" "$minimap2_paf"
+}
+
+score_translated_paf() {
+  local baseline_paf="${1:?missing BASELINE_PAF}"
+  local assisted_paf="${2:?missing ASSISTED_PAF}"
+  awk -F '\t' '
+    FILENAME == ARGV[1] {
+      if (NF < 12) next
+      baseline_alignments += 1
+      query = $1
+      target = $6
+      start = $8 + 0
+      end = $9 + 0
+      idx = ++baseline_count[query]
+      baseline_target[query, idx] = target
+      baseline_start[query, idx] = start
+      baseline_end[query, idx] = end
+      baseline_query[query] = 1
+      next
+    }
+    FILENAME == ARGV[2] {
+      if (NF < 12) next
+      assisted_alignments += 1
+      query = $1
+      target = $6
+      offset = 0
+      if (match(target, /:[0-9]+-[0-9]+$/)) {
+        coord = substr(target, RSTART + 1)
+        original = substr(target, 1, RSTART - 1)
+        split(coord, parts, "-")
+        offset = parts[1] + 0
+        target = original
+      }
+      start = ($8 + 0) + offset
+      end = ($9 + 0) + offset
+      assisted_query[query] = 1
+      for (idx = 1; idx <= baseline_count[query]; idx++) {
+        if (baseline_target[query, idx] != target) continue
+        if (end <= baseline_start[query, idx]) continue
+        if (start >= baseline_end[query, idx]) continue
+        parity_hit[query] = 1
+      }
+      next
+    }
+    END {
+      for (query in baseline_query) baseline_queries += 1
+      for (query in assisted_query) assisted_queries += 1
+      for (query in parity_hit) parity_hits += 1
+      printf "metric\tvalue\n"
+      printf "baseline_alignments\t%d\n", baseline_alignments
+      printf "assisted_alignments\t%d\n", assisted_alignments
+      printf "baseline_mapped_queries\t%d\n", baseline_queries
+      printf "assisted_mapped_queries\t%d\n", assisted_queries
+      printf "parity_hits\t%d\n", parity_hits
+      if (baseline_queries > 0) {
+        printf "mapped_query_recall\t%.6f\n", assisted_queries / baseline_queries
+        printf "coordinate_parity\t%.6f\n", parity_hits / baseline_queries
+      } else {
+        printf "mapped_query_recall\tNA\n"
+        printf "coordinate_parity\tNA\n"
+      }
+    }
+  ' "$baseline_paf" "$assisted_paf"
+}
+
+retrieval_config_lines() {
+  local mode="$1"
+  case "$mode" in
+    minimizer)
+      cat <<'CONFIGS'
+k11_mw4_limit256	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 256 --minimizer-k 11 --minimizer-window 4
+k15_mw8_limit256	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 256 --minimizer-k 15 --minimizer-window 8
+k15_mw8_limit64	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 64 --minimizer-k 15 --minimizer-window 8
+CONFIGS
+      ;;
+    simhash)
+      cat <<'CONFIGS'
+bands4_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048 --simhash-bands 4
+bands8_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048 --simhash-bands 8
+bands16_limit8192	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 8192 --simhash-bands 16
+CONFIGS
+      ;;
+    mih)
+      cat <<'CONFIGS'
+dim128_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048
+dim128_limit8192	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 8192
+dim256_limit8192	--window 64 --stride 16 --dim 256 --top-k 20 --candidate-limit 8192
+CONFIGS
+      ;;
+    ivf)
+      cat <<'CONFIGS'
+c32_p4_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048 --centroids 32 --probes 4
+c128_p4_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048 --centroids 128 --probes 4
+c128_p8_limit8192	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 8192 --centroids 128 --probes 8
+CONFIGS
+      ;;
+    hnsw)
+      cat <<'CONFIGS'
+c32_p4_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048 --centroids 32 --probes 4
+c128_p4_limit2048	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 2048 --centroids 128 --probes 4
+c128_p8_limit8192	--window 64 --stride 16 --dim 128 --top-k 20 --candidate-limit 8192 --centroids 128 --probes 8
+CONFIGS
+      ;;
+    *)
+      printf 'unknown retrieval mode: %s\n' "$mode" >&2
+      return 2
+      ;;
+  esac
+}
+
+optimize_retrieval() {
+  local mode="${1:?missing retrieval mode}"
+  local sizes="${DINO_QUANT_OPT_SIZES:-100 1000 3000}"
+  local run_id
+  local run_dir
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  run_id="${stamp}-optimize_retrieval_${mode}"
+  run_dir="$lab_root/runs/$run_id"
+  init_lab >/dev/null
+  acquire ecoli_mg1655_ref >/dev/null
+  prepare_read_slices >/dev/null
+  mkdir -p "$run_dir"
+  {
+    printf 'matrix_id\toptimize_retrieval_%s\n' "$mode"
+    printf 'tool\tdino-quant+minimap2\n'
+    printf 'stage\toptimize\n'
+    printf 'data_id\tecoli_srr001666_r1\n'
+    printf 'variant\t%s\n' "$mode"
+    printf 'threads\t%s\n' "$bench_threads"
+  } > "$run_dir/metadata.tsv"
+  cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+"$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+  "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+  > "$run_dir/minimap2.paf"
+printf 'mode\tconfig\treads\tcandidate_rows\tmapped_queries\ttop1_recall\ttop5_recall\ttop10_recall\ttop20_recall\tavg_considered\telapsed_ms\n' > "$run_dir/optimization.tsv"
+while IFS=\$'\t' read -r config args; do
+  [ -n "\$config" ] || continue
+  for reads in $sizes; do
+    candidates="$run_dir/candidates-\${config}-\${reads}.tsv"
+    parity="$run_dir/parity-\${config}-\${reads}.tsv"
+    log="$run_dir/candidates-\${config}-\${reads}.stderr.txt"
+    start_ns=\$(date +%s%N)
+    cargo run -p dino-quant --release -- emit-candidates \
+      "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+      --retrieval "$mode" \$args --max-reads "\$reads" \
+      > "\$candidates" 2> "\$log"
+    end_ns=\$(date +%s%N)
+    scripts/quant-lab score-minimap2-candidates "\$candidates" "$run_dir/minimap2.paf" > "\$parity"
+    rows=\$((\$(wc -l < "\$candidates") - 1))
+    mapped=\$(awk -F '\t' '\$1 == "scored_mapped_queries" { print \$2 }' "\$parity")
+    top1=\$(awk -F '\t' '\$1 == "top1_recall" { print \$2 }' "\$parity")
+    top5=\$(awk -F '\t' '\$1 == "top5_recall" { print \$2 }' "\$parity")
+    top10=\$(awk -F '\t' '\$1 == "top10_recall" { print \$2 }' "\$parity")
+    top20=\$(awk -F '\t' '\$1 == "top20_recall" { print \$2 }' "\$parity")
+    avg=\$(awk 'match(\$0, /avg_considered=([0-9.]+)/) { print substr(\$0, RSTART + 15, RLENGTH - 15) }' "\$log")
+    elapsed_ms=\$(((end_ns - start_ns) / 1000000))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$mode" "\$config" "\$reads" "\$rows" "\$mapped" "\$top1" "\$top5" "\$top10" "\$top20" "\${avg:-NA}" "\$elapsed_ms" >> "$run_dir/optimization.tsv"
+  done
+done < "$run_dir/configs.tsv"
+cat "$run_dir/optimization.tsv"
+RUN
+  retrieval_config_lines "$mode" > "$run_dir/configs.tsv"
+  chmod +x "$run_dir/run.sh"
+  run_timed "$run_dir" bash "$run_dir/run.sh"
+  printf 'run_dir\t%s\n' "$run_dir"
+}
+
+assisted_minimap2_cache_dir() {
+  printf '%s/data/assisted/minimap2-ecoli-r1-10k-minimizer-k15-mw8-limit64-w64-s16-d128-top20-pad64-gap32-masked-v2\n' "$lab_root"
+}
+
+assisted_minimap2_bundle_cache_dir() {
+  printf '%s/data/assisted/minimap2-bundle-r1-10k-minimizer-k15-mw8-limit64-w64-s16-d128-top20-pad64-gap32-masked-v1\n' "$lab_root"
+}
+
+assisted_minimap2_bundle_config_cache_dir() {
+  local top_k="${1:?missing top_k}"
+  local candidate_limit="${2:?missing candidate_limit}"
+  local padding="${3:?missing padding}"
+  local merge_gap="${4:?missing merge_gap}"
+  printf '%s/data/assisted/minimap2-bundle-r1-10k-minimizer-tk%s-limit%s-pad%s-gap%s-masked-v1\n' \
+    "$lab_root" "$top_k" "$candidate_limit" "$padding" "$merge_gap"
+}
+
+prepare_minimap2_bundle_index() {
+  local ref
+  local index
+  prepare_reference_bundle >/dev/null
+  ref="$lab_root/data/prepared/genomes.fna"
+  index="$lab_root/data/indexes/minimap2/genomes.sr.mmi"
+  mkdir -p "$(dirname "$index")"
+  if [ ! -s "$index" ] || [ "$ref" -nt "$index" ]; then
+    "$lab_root/tools/minimap2/minimap2" -x sr -d "$index.tmp" "$ref" \
+      > "$lab_root/data/indexes/minimap2/genomes-index.stdout.txt" \
+      2> "$lab_root/data/indexes/minimap2/genomes-index.stderr.txt"
+    mv "$index.tmp" "$index"
+  fi
+}
+
+prepare_assisted_minimap2() {
+  local cache_dir
+  local reads
+  local ref
+  cache_dir="$(assisted_minimap2_cache_dir)"
+  reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+  ref="$(dataset_path ecoli_mg1655_ref)"
+  init_lab >/dev/null
+  acquire ecoli_mg1655_ref >/dev/null
+  prepare_read_slices >/dev/null
+  mkdir -p "$cache_dir"
+
+  if [ "${DINO_QUANT_REBUILD_CACHE:-0}" = "1" ]; then
+    find "$cache_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  fi
+
+  if [ ! -s "$cache_dir/candidates.tsv" ]; then
+    cargo run -p dino-quant --release -- emit-candidates "$ref" "$reads" \
+      --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+      --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+      --reference-cache "$cache_dir/reference-index.dqmi" --max-reads 10000 \
+      > "$cache_dir/candidates.tsv.tmp" 2> "$cache_dir/candidates.stderr.txt"
+    mv "$cache_dir/candidates.tsv.tmp" "$cache_dir/candidates.tsv"
+  fi
+
+  if [ ! -s "$cache_dir/candidate-reference.fna" ]; then
+    cargo run -p dino-quant --release -- emit-candidate-reference "$ref" "$cache_dir/candidates.tsv" \
+      --padding 64 --merge-gap 32 --mask-reference \
+      > "$cache_dir/candidate-reference.fna.tmp" 2> "$cache_dir/candidate-reference.stderr.txt"
+    mv "$cache_dir/candidate-reference.fna.tmp" "$cache_dir/candidate-reference.fna"
+  fi
+
+  if [ ! -s "$cache_dir/candidate-reference.mmi" ] || [ "$cache_dir/candidate-reference.fna" -nt "$cache_dir/candidate-reference.mmi" ]; then
+    "$lab_root/tools/minimap2/minimap2" -x sr -d \
+      "$cache_dir/candidate-reference.mmi.tmp" \
+      "$cache_dir/candidate-reference.fna" \
+      > "$cache_dir/minimap2-index.stdout.txt" 2> "$cache_dir/minimap2-index.stderr.txt"
+    mv "$cache_dir/candidate-reference.mmi.tmp" "$cache_dir/candidate-reference.mmi"
+  fi
+
+  if [ ! -s "$cache_dir/baseline.paf" ]; then
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "$ref" "$reads" \
+      > "$cache_dir/baseline.paf.tmp" 2> "$cache_dir/baseline.stderr.txt"
+    mv "$cache_dir/baseline.paf.tmp" "$cache_dir/baseline.paf"
+  fi
+
+  {
+    printf 'cache_dir\t%s\n' "$cache_dir"
+    printf 'reference\t%s\n' "$ref"
+    printf 'reads\t%s\n' "$reads"
+    printf 'candidate_rows\t%s\n' "$(( $(wc -l < "$cache_dir/candidates.tsv") - 1 ))"
+    printf 'candidate_reference_records\t%s\n' "$(awk '/^>/ { records += 1 } END { print records + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_bases\t%s\n' "$(awk '!/^>/ { bases += length($0) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_unmasked_bases\t%s\n' "$(awk '!/^>/ { line=$0; gsub(/N/, "", line); bases += length(line) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_masked_bases\t%s\n' "$(awk '!/^>/ { total += length($0); line=$0; gsub(/N/, "", line); kept += length(line) } END { print total - kept }' "$cache_dir/candidate-reference.fna")"
+  } > "$cache_dir/manifest.tsv"
+  cat "$cache_dir/manifest.tsv"
+}
+
+prepare_assisted_minimap2_bundle() {
+  local cache_dir
+  local reads
+  local ref
+  cache_dir="$(assisted_minimap2_bundle_cache_dir)"
+  reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+  ref="$lab_root/data/prepared/genomes.fna"
+  init_lab >/dev/null
+  prepare_minimap2_bundle_index >/dev/null
+  prepare_read_slices >/dev/null
+  mkdir -p "$cache_dir"
+
+  if [ "${DINO_QUANT_REBUILD_CACHE:-0}" = "1" ]; then
+    find "$cache_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  fi
+
+  if [ ! -s "$cache_dir/candidates.tsv" ]; then
+    cargo run -p dino-quant --release -- emit-candidates "$ref" "$reads" \
+      --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+      --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+      --reference-cache "$cache_dir/reference-index.dqmi" --max-reads 10000 \
+      > "$cache_dir/candidates.tsv.tmp" 2> "$cache_dir/candidates.stderr.txt"
+    mv "$cache_dir/candidates.tsv.tmp" "$cache_dir/candidates.tsv"
+  fi
+
+  if [ ! -s "$cache_dir/candidate-reference.fna" ]; then
+    cargo run -p dino-quant --release -- emit-candidate-reference "$ref" "$cache_dir/candidates.tsv" \
+      --padding 64 --merge-gap 32 --mask-reference \
+      > "$cache_dir/candidate-reference.fna.tmp" 2> "$cache_dir/candidate-reference.stderr.txt"
+    mv "$cache_dir/candidate-reference.fna.tmp" "$cache_dir/candidate-reference.fna"
+  fi
+
+  if [ ! -s "$cache_dir/candidate-reference.mmi" ] || [ "$cache_dir/candidate-reference.fna" -nt "$cache_dir/candidate-reference.mmi" ]; then
+    "$lab_root/tools/minimap2/minimap2" -x sr -d \
+      "$cache_dir/candidate-reference.mmi.tmp" \
+      "$cache_dir/candidate-reference.fna" \
+      > "$cache_dir/minimap2-index.stdout.txt" 2> "$cache_dir/minimap2-index.stderr.txt"
+    mv "$cache_dir/candidate-reference.mmi.tmp" "$cache_dir/candidate-reference.mmi"
+  fi
+
+  if [ ! -s "$cache_dir/baseline.paf" ]; then
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "$lab_root/data/indexes/minimap2/genomes.sr.mmi" "$reads" \
+      > "$cache_dir/baseline.paf.tmp" 2> "$cache_dir/baseline.stderr.txt"
+    mv "$cache_dir/baseline.paf.tmp" "$cache_dir/baseline.paf"
+  fi
+
+  {
+    printf 'cache_dir\t%s\n' "$cache_dir"
+    printf 'reference\t%s\n' "$ref"
+    printf 'reads\t%s\n' "$reads"
+    printf 'candidate_rows\t%s\n' "$(( $(wc -l < "$cache_dir/candidates.tsv") - 1 ))"
+    printf 'candidate_reference_records\t%s\n' "$(awk '/^>/ { records += 1 } END { print records + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_bases\t%s\n' "$(awk '!/^>/ { bases += length($0) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_unmasked_bases\t%s\n' "$(awk '!/^>/ { line=$0; gsub(/N/, "", line); bases += length(line) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_masked_bases\t%s\n' "$(awk '!/^>/ { total += length($0); line=$0; gsub(/N/, "", line); kept += length(line) } END { print total - kept }' "$cache_dir/candidate-reference.fna")"
+    [ -s "$cache_dir/reference-index.dqmi" ] && printf 'reference_cache_bytes\t%s\n' "$(stat -c %s "$cache_dir/reference-index.dqmi")"
+  } > "$cache_dir/manifest.tsv"
+  cat "$cache_dir/manifest.tsv"
+}
+
+prepare_assisted_minimap2_bundle_config() {
+  local top_k="${1:?missing top_k}"
+  local candidate_limit="${2:?missing candidate_limit}"
+  local padding="${3:?missing padding}"
+  local merge_gap="${4:?missing merge_gap}"
+  local cache_dir
+  local reads
+  local ref
+  cache_dir="$(assisted_minimap2_bundle_config_cache_dir "$top_k" "$candidate_limit" "$padding" "$merge_gap")"
+  reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+  ref="$lab_root/data/prepared/genomes.fna"
+  init_lab >/dev/null
+  prepare_minimap2_bundle_index >/dev/null
+  prepare_read_slices >/dev/null
+  mkdir -p "$cache_dir"
+
+  if [ "${DINO_QUANT_REBUILD_CACHE:-0}" = "1" ]; then
+    find "$cache_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  fi
+
+  if [ ! -s "$cache_dir/candidates.tsv" ]; then
+    cargo run -p dino-quant --release -- emit-candidates "$ref" "$reads" \
+      --retrieval minimizer --top-k "$top_k" --window 64 --stride 16 --dim 128 \
+      --candidate-limit "$candidate_limit" --minimizer-k 15 --minimizer-window 8 \
+      --reference-cache "$cache_dir/reference-index.dqmi" --max-reads 10000 \
+      > "$cache_dir/candidates.tsv.tmp" 2> "$cache_dir/candidates.stderr.txt"
+    mv "$cache_dir/candidates.tsv.tmp" "$cache_dir/candidates.tsv"
+  fi
+
+  if [ ! -s "$cache_dir/candidate-reference.fna" ]; then
+    cargo run -p dino-quant --release -- emit-candidate-reference "$ref" "$cache_dir/candidates.tsv" \
+      --padding "$padding" --merge-gap "$merge_gap" --mask-reference \
+      > "$cache_dir/candidate-reference.fna.tmp" 2> "$cache_dir/candidate-reference.stderr.txt"
+    mv "$cache_dir/candidate-reference.fna.tmp" "$cache_dir/candidate-reference.fna"
+  fi
+
+  if [ ! -s "$cache_dir/candidate-reference.mmi" ] || [ "$cache_dir/candidate-reference.fna" -nt "$cache_dir/candidate-reference.mmi" ]; then
+    "$lab_root/tools/minimap2/minimap2" -x sr -d \
+      "$cache_dir/candidate-reference.mmi.tmp" \
+      "$cache_dir/candidate-reference.fna" \
+      > "$cache_dir/minimap2-index.stdout.txt" 2> "$cache_dir/minimap2-index.stderr.txt"
+    mv "$cache_dir/candidate-reference.mmi.tmp" "$cache_dir/candidate-reference.mmi"
+  fi
+
+  {
+    printf 'cache_dir\t%s\n' "$cache_dir"
+    printf 'top_k\t%s\n' "$top_k"
+    printf 'candidate_limit\t%s\n' "$candidate_limit"
+    printf 'padding\t%s\n' "$padding"
+    printf 'merge_gap\t%s\n' "$merge_gap"
+    printf 'reference\t%s\n' "$ref"
+    printf 'reads\t%s\n' "$reads"
+    printf 'candidate_rows\t%s\n' "$(( $(wc -l < "$cache_dir/candidates.tsv") - 1 ))"
+    printf 'candidate_reference_records\t%s\n' "$(awk '/^>/ { records += 1 } END { print records + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_bases\t%s\n' "$(awk '!/^>/ { bases += length($0) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_unmasked_bases\t%s\n' "$(awk '!/^>/ { line=$0; gsub(/N/, "", line); bases += length(line) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_masked_bases\t%s\n' "$(awk '!/^>/ { total += length($0); line=$0; gsub(/N/, "", line); kept += length(line) } END { print total - kept }' "$cache_dir/candidate-reference.fna")"
+    printf 'candidate_reference_mmi_bytes\t%s\n' "$(stat -c %s "$cache_dir/candidate-reference.mmi")"
+    [ -s "$cache_dir/reference-index.dqmi" ] && printf 'reference_cache_bytes\t%s\n' "$(stat -c %s "$cache_dir/reference-index.dqmi")"
+  } > "$cache_dir/manifest.tsv"
+  cat "$cache_dir/manifest.tsv"
+}
+
+assisted_bundle_tune_configs() {
+  cat <<'CONFIGS'
+20 64 64 32
+20 32 64 32
+10 64 64 32
+10 32 64 32
+10 32 32 16
+5 32 32 16
+5 16 32 16
+5 16 16 0
+CONFIGS
+}
+
+tune_assisted_minimap2_bundle() {
+  local run_id
+  local run_dir
+  local reads
+  local full_mmi
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  run_id="${stamp}-quant_minimap2_assisted_bundle_optimizer_ecoli"
+  run_dir="${DINO_QUANT_TUNE_RUN_DIR:-"$lab_root/runs/$run_id"}"
+  init_lab >/dev/null
+  prepare_minimap2_bundle_index >/dev/null
+  prepare_read_slices >/dev/null
+  mkdir -p "$run_dir"
+  reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+  full_mmi="$lab_root/data/indexes/minimap2/genomes.sr.mmi"
+  {
+    printf 'matrix_id\tquant_minimap2_assisted_bundle_optimizer_ecoli\n'
+    printf 'tool\tdino-quant+minimap2\n'
+    printf 'stage\toptimize\n'
+    printf 'data_id\tecoli_srr001666_r1\n'
+    printf 'variant\tmasked-bundle-optimizer\n'
+    printf 'threads\t%s\n' "$bench_threads"
+  } > "$run_dir/metadata.tsv"
+  cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+reads="$reads"
+full_mmi="$full_mmi"
+start_ns=\$(date +%s%N)
+/usr/bin/time -v -o "$run_dir/baseline.time.txt" \
+  "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$full_mmi" "\$reads" \
+  > "$run_dir/baseline.paf" 2> "$run_dir/baseline.stderr.txt"
+end_ns=\$(date +%s%N)
+baseline_ms=\$(((end_ns - start_ns) / 1000000))
+baseline_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/baseline.time.txt")
+printf 'top_k\tcandidate_limit\tpadding\tmerge_gap\tprepare_ms\tmapper_ms\tspeedup\tbaseline_rss_kb\tassisted_rss_kb\tcandidate_rows\tunmasked_bases\tmmi_bytes\tmapped_query_recall\tcoordinate_parity\n' > "$run_dir/optimizer.tsv"
+while read -r top_k candidate_limit padding merge_gap; do
+  [ -n "\$top_k" ] || continue
+  start_ns=\$(date +%s%N)
+  scripts/quant-lab prepare-assisted-minimap2-bundle-config "\$top_k" "\$candidate_limit" "\$padding" "\$merge_gap" \
+    > "$run_dir/manifest-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.tsv"
+  end_ns=\$(date +%s%N)
+  prepare_ms=\$(((end_ns - start_ns) / 1000000))
+  manifest="$run_dir/manifest-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.tsv"
+  cache_dir=\$(awk -F '\t' '\$1 == "cache_dir" { print \$2 }' "\$manifest")
+  candidate_rows=\$(awk -F '\t' '\$1 == "candidate_rows" { print \$2 }' "\$manifest")
+  unmasked=\$(awk -F '\t' '\$1 == "candidate_reference_unmasked_bases" { print \$2 }' "\$manifest")
+  mmi_bytes=\$(awk -F '\t' '\$1 == "candidate_reference_mmi_bytes" { print \$2 }' "\$manifest")
+  start_ns=\$(date +%s%N)
+  /usr/bin/time -v -o "$run_dir/assisted-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.time.txt" \
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$cache_dir/candidate-reference.mmi" "\$reads" \
+    > "$run_dir/assisted-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.paf" \
+    2> "$run_dir/assisted-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.stderr.txt"
+  end_ns=\$(date +%s%N)
+  mapper_ms=\$(((end_ns - start_ns) / 1000000))
+  scripts/quant-lab score-translated-paf "$run_dir/baseline.paf" \
+    "$run_dir/assisted-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.paf" \
+    > "$run_dir/parity-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.tsv"
+  assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.time.txt")
+  mapped_recall=\$(awk -F '\t' '\$1 == "mapped_query_recall" { print \$2 }' "$run_dir/parity-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.tsv")
+  coord_parity=\$(awk -F '\t' '\$1 == "coordinate_parity" { print \$2 }' "$run_dir/parity-tk\${top_k}-limit\${candidate_limit}-pad\${padding}-gap\${merge_gap}.tsv")
+  speedup=\$(awk -v base="\$baseline_ms" -v assisted="\$mapper_ms" 'BEGIN { if (assisted > 0) printf "%.3f", base / assisted; else print "NA" }')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "\$top_k" "\$candidate_limit" "\$padding" "\$merge_gap" "\$prepare_ms" "\$mapper_ms" "\$speedup" \
+    "\$baseline_rss" "\$assisted_rss" "\$candidate_rows" "\$unmasked" "\$mmi_bytes" "\$mapped_recall" "\$coord_parity" \
+    >> "$run_dir/optimizer.tsv"
+done < "$run_dir/configs.txt"
+{
+  head -n 1 "$run_dir/optimizer.tsv"
+  tail -n +2 "$run_dir/optimizer.tsv" | sort -t \$'\t' -k14,14r -k13,13r -k11,11n -k6,6n
+} > "$run_dir/optimizer-ranked.tsv"
+cat "$run_dir/optimizer-ranked.tsv"
+RUN
+  assisted_bundle_tune_configs > "$run_dir/configs.txt"
+  chmod +x "$run_dir/run.sh"
+  run_timed "$run_dir" bash "$run_dir/run.sh"
+  printf 'run_dir\t%s\n' "$run_dir"
+}
+
+successful_run_exists() {
+  local matrix_id="$1"
+  find "$lab_root/runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+    while IFS= read -r run_dir; do
+      [ -f "$run_dir/metadata.tsv" ] || continue
+      [ -f "$run_dir/time.txt" ] || continue
+      current_id="$(awk -F '\t' '$1 == "matrix_id" { print $2 }' "$run_dir/metadata.tsv")"
+      [ "$current_id" = "$matrix_id" ] || continue
+      if awk -F ': ' 'index($0, "Exit status") && $NF == "0" { found = 1 } END { exit !found }' "$run_dir/time.txt"; then
+        printf '%s\n' "$run_dir"
+        exit 0
+      fi
+    done
+}
+
+run_matrix() {
+  local matrix_id="${1:?missing MATRIX_ID}"
+  local tool
+  local stage
+  local data_id
+  local variant
+  local status
+  local run_id
+  local run_dir
+  tool="$(matrix_field "$matrix_id" tool)"
+  stage="$(matrix_field "$matrix_id" stage)"
+  data_id="$(matrix_field "$matrix_id" data_id)"
+  variant="$(matrix_field "$matrix_id" variant)"
+  status="$(matrix_field "$matrix_id" status)"
+  if [ "$status" != "ready" ]; then
+    printf 'not_ready\t%s\tstatus=%s\n' "$matrix_id" "$status" >&2
+    exit 1
+  fi
+
+  init_lab >/dev/null
+  if [ "${DINO_QUANT_FORCE:-0}" != "1" ]; then
+    existing="$(successful_run_exists "$matrix_id" || true)"
+    if [ -n "$existing" ]; then
+      printf 'skip_existing\t%s\t%s\n' "$matrix_id" "$existing"
+      return 0
+    fi
+  fi
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$matrix_id"
+  run_dir="$lab_root/runs/$run_id"
+  mkdir -p "$run_dir"
+  {
+    printf 'matrix_id\t%s\n' "$matrix_id"
+    printf 'tool\t%s\n' "$tool"
+    printf 'stage\t%s\n' "$stage"
+    printf 'data_id\t%s\n' "$data_id"
+    printf 'variant\t%s\n' "$variant"
+    printf 'threads\t%s\n' "$bench_threads"
+  } > "$run_dir/metadata.tsv"
+
+  case "$matrix_id" in
+    smoke_minimap2)
+      run_timed "$run_dir" "$lab_root/tools/minimap2/minimap2" --version
+      ;;
+    smoke_bowtie2)
+      run_timed "$run_dir" "$lab_root/tools/bowtie2/bowtie2" --version
+      ;;
+    smoke_kraken2)
+      run_timed "$run_dir" "$lab_root/tools/kraken2/install/kraken2" --version
+      ;;
+    smoke_sourmash)
+      run_timed "$run_dir" "$lab_root/tools/sourmash/.venv/bin/sourmash" --version
+      ;;
+    smoke_spades)
+      run_timed "$run_dir" "$lab_root/tools/spades/bin/spades.py" --version
+      ;;
+    smoke_diamond)
+      run_timed "$run_dir" "$lab_root/tools/diamond/build/diamond" version
+      ;;
+    quant_sweep_ecoli)
+      acquire ecoli_mg1655_ref >/dev/null
+      run_timed "$run_dir" cargo run -p dino-quant --release -- sweep-fasta \
+        "$(dataset_path ecoli_mg1655_ref)" --queries 128 --top-k 10 --max-bases 1000000
+      ;;
+    quant_candidates_ecoli)
+      acquire ecoli_mg1655_ref >/dev/null
+      prepare_read_slices >/dev/null
+      run_timed "$run_dir" cargo run -p dino-quant --release -- emit-candidates \
+        "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+        --top-k 10 --max-bases 1000000 --max-reads 10000
+      ;;
+    quant_protein_ecoli)
+      acquire ecoli_mg1655_protein >/dev/null
+      acquire salmonella_lt2_protein >/dev/null
+      acquire bacillus_168_protein >/dev/null
+      prepare_protein_bundle >/dev/null
+      run_timed "$run_dir" cargo run -p dino-quant --release -- emit-protein-candidates \
+        "$lab_root/data/prepared/proteins.faa" "$(dataset_path ecoli_mg1655_protein)" \
+        --top-k 10 --max-bases 200000
+      ;;
+    quant_minimap2_parity_sweep_ecoli)
+      acquire ecoli_mg1655_ref >/dev/null
+      prepare_read_slices >/dev/null
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+"$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+  "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+  > "$run_dir/minimap2.paf"
+printf 'window\tstride\ttop_k\tdim\tcandidate_rows\tmapped_queries\ttop1_recall\ttop5_recall\ttop10_recall\ttop20_recall\telapsed_ms\n' > "$run_dir/sweep.tsv"
+while read -r window stride top_k dim; do
+  candidates="$run_dir/candidates-w\${window}-s\${stride}-k\${top_k}-d\${dim}.tsv"
+  parity="$run_dir/parity-w\${window}-s\${stride}-k\${top_k}-d\${dim}.tsv"
+  log="$run_dir/candidates-w\${window}-s\${stride}-k\${top_k}-d\${dim}.stderr.txt"
+  start_ns=\$(date +%s%N)
+  cargo run -p dino-quant --release -- emit-candidates \
+    "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+    --top-k "\$top_k" --window "\$window" --stride "\$stride" --dim "\$dim" --max-reads 1000 \
+    > "\$candidates" 2> "\$log"
+  end_ns=\$(date +%s%N)
+  scripts/quant-lab score-minimap2-candidates "\$candidates" "$run_dir/minimap2.paf" > "\$parity"
+  rows=\$((\$(wc -l < "\$candidates") - 1))
+  mapped=\$(awk -F '\t' '\$1 == "scored_mapped_queries" { print \$2 }' "\$parity")
+  top1=\$(awk -F '\t' '\$1 == "top1_recall" { print \$2 }' "\$parity")
+  top5=\$(awk -F '\t' '\$1 == "top5_recall" { print \$2 }' "\$parity")
+  top10=\$(awk -F '\t' '\$1 == "top10_recall" { print \$2 }' "\$parity")
+  top20=\$(awk -F '\t' '\$1 == "top20_recall" { print \$2 }' "\$parity")
+  elapsed_ms=\$(((end_ns - start_ns) / 1000000))
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "\$window" "\$stride" "\$top_k" "\$dim" "\$rows" "\$mapped" \
+    "\$top1" "\$top5" "\$top10" "\$top20" "\$elapsed_ms" >> "$run_dir/sweep.tsv"
+done <<'CONFIGS'
+1024 256 20 256
+512 128 20 256
+256 64 20 256
+128 32 20 128
+64 16 20 128
+CONFIGS
+cat "$run_dir/sweep.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_minimap2_parity_ecoli_fullref)
+      acquire ecoli_mg1655_ref >/dev/null
+      prepare_read_slices >/dev/null
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+cargo run -p dino-quant --release -- emit-candidates \
+  "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+  --top-k 10 --max-reads 10000 > "$run_dir/candidates.tsv"
+"$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+  "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+  > "$run_dir/minimap2.paf"
+scripts/quant-lab score-minimap2-candidates \
+  "$run_dir/candidates.tsv" "$run_dir/minimap2.paf" > "$run_dir/parity.tsv"
+cat "$run_dir/parity.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_retrieval_modes_ecoli)
+      acquire ecoli_mg1655_ref >/dev/null
+      prepare_read_slices >/dev/null
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+"$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+  "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+  > "$run_dir/minimap2.paf"
+printf 'mode\tcandidate_rows\tmapped_queries\ttop1_recall\ttop5_recall\ttop10_recall\ttop20_recall\tavg_considered\telapsed_ms\n' > "$run_dir/retrieval.tsv"
+for mode in minimizer simhash mih ivf hnsw; do
+  candidates="$run_dir/candidates-\${mode}.tsv"
+  parity="$run_dir/parity-\${mode}.tsv"
+  log="$run_dir/candidates-\${mode}.stderr.txt"
+  start_ns=\$(date +%s%N)
+  cargo run -p dino-quant --release -- emit-candidates \
+    "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+    --retrieval "\$mode" --top-k 20 --window 64 --stride 16 --dim 128 \
+    --candidate-limit 2048 --centroids 32 --probes 4 --max-reads 1000 \
+    > "\$candidates" 2> "\$log"
+  end_ns=\$(date +%s%N)
+  scripts/quant-lab score-minimap2-candidates "\$candidates" "$run_dir/minimap2.paf" > "\$parity"
+  rows=\$((\$(wc -l < "\$candidates") - 1))
+  mapped=\$(awk -F '\t' '\$1 == "scored_mapped_queries" { print \$2 }' "\$parity")
+  top1=\$(awk -F '\t' '\$1 == "top1_recall" { print \$2 }' "\$parity")
+  top5=\$(awk -F '\t' '\$1 == "top5_recall" { print \$2 }' "\$parity")
+  top10=\$(awk -F '\t' '\$1 == "top10_recall" { print \$2 }' "\$parity")
+  top20=\$(awk -F '\t' '\$1 == "top20_recall" { print \$2 }' "\$parity")
+  avg=\$(awk 'match(\$0, /avg_considered=([0-9.]+)/) { print substr(\$0, RSTART + 15, RLENGTH - 15) }' "\$log")
+  elapsed_ms=\$(((end_ns - start_ns) / 1000000))
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "\$mode" "\$rows" "\$mapped" "\$top1" "\$top5" "\$top10" "\$top20" "\${avg:-NA}" "\$elapsed_ms" >> "$run_dir/retrieval.tsv"
+done
+cat "$run_dir/retrieval.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_minimap2_assisted_ecoli)
+      acquire ecoli_mg1655_ref >/dev/null
+      prepare_read_slices >/dev/null
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+ref="$(dataset_path ecoli_mg1655_ref)"
+"$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$ref" "\$reads" \
+  > "$run_dir/baseline.paf"
+cargo run -p dino-quant --release -- emit-candidates "\$ref" "\$reads" \
+  --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+  --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 --max-reads 10000 \
+  > "$run_dir/candidates.tsv" 2> "$run_dir/candidates.stderr.txt"
+cargo run -p dino-quant --release -- emit-candidate-reference "\$ref" "$run_dir/candidates.tsv" \
+  --padding 64 --merge-gap 32 \
+  > "$run_dir/candidate-reference.fna" 2> "$run_dir/candidate-reference.stderr.txt"
+"$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+  "$run_dir/candidate-reference.fna" "\$reads" \
+  > "$run_dir/assisted.paf"
+scripts/quant-lab score-translated-paf "$run_dir/baseline.paf" "$run_dir/assisted.paf" \
+  > "$run_dir/parity.tsv"
+{
+  printf 'metric\tvalue\n'
+  printf 'candidate_reference_bases\t%s\n' "\$(awk '!/^>/ { bases += length(\$0) } END { print bases + 0 }' "$run_dir/candidate-reference.fna")"
+  printf 'candidate_reference_records\t%s\n' "\$(awk '/^>/ { records += 1 } END { print records + 0 }' "$run_dir/candidate-reference.fna")"
+  printf 'candidate_rows\t%s\n' "\$((\$(wc -l < "$run_dir/candidates.tsv") - 1))"
+  awk 'NR > 1 { print }' "$run_dir/parity.tsv"
+} > "$run_dir/assisted-summary.tsv"
+cat "$run_dir/assisted-summary.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_minimap2_assisted_cached_ecoli)
+      prepare_assisted_minimap2 > "$run_dir/cache-manifest.tsv"
+      cache_dir="$(assisted_minimap2_cache_dir)"
+      run_timed "$run_dir" "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+        "$cache_dir/candidate-reference.mmi" \
+        "$lab_root/data/prepared/SRR001666_1.10k.fastq"
+      mv "$run_dir/stdout.txt" "$run_dir/assisted.paf"
+      scripts/quant-lab score-translated-paf "$cache_dir/baseline.paf" "$run_dir/assisted.paf" \
+        > "$run_dir/parity.tsv"
+      {
+        printf 'metric\tvalue\n'
+        awk -F '\t' 'NR > 0 { print }' "$run_dir/cache-manifest.tsv"
+        awk 'NR > 1 { print }' "$run_dir/parity.tsv"
+      } > "$run_dir/assisted-summary.tsv"
+      ;;
+    quant_minimap2_assisted_cached_scale_ecoli)
+      prepare_assisted_minimap2 > "$run_dir/cache-manifest.tsv"
+      [ -f "$lab_root/data/indexes/minimap2/ecoli_mg1655.sr.mmi" ] || prepare_one minimap2
+      cache_dir="$(assisted_minimap2_cache_dir)"
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+source_reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+full_mmi="$lab_root/data/indexes/minimap2/ecoli_mg1655.sr.mmi"
+assisted_mmi="$cache_dir/candidate-reference.mmi"
+printf 'reads\tbaseline_ms\tassisted_ms\tspeedup\tbaseline_rss_kb\tassisted_rss_kb\tbaseline_alignments\tassisted_alignments\tmapped_query_recall\tcoordinate_parity\n' > "$run_dir/scale.tsv"
+for reads in 100 1000 3000 10000; do
+  slice="$run_dir/reads-\${reads}.fastq"
+  if [ "\$reads" = "10000" ]; then
+    slice="\$source_reads"
+  else
+    awk -v max_lines="\$((reads * 4))" 'NR <= max_lines { print }' "\$source_reads" > "\$slice"
+  fi
+
+  start_ns=\$(date +%s%N)
+  /usr/bin/time -v -o "$run_dir/baseline-\${reads}.time.txt" \
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$full_mmi" "\$slice" \
+    > "$run_dir/baseline-\${reads}.paf" 2> "$run_dir/baseline-\${reads}.stderr.txt"
+  end_ns=\$(date +%s%N)
+  baseline_ms=\$(((end_ns - start_ns) / 1000000))
+
+  start_ns=\$(date +%s%N)
+  /usr/bin/time -v -o "$run_dir/assisted-\${reads}.time.txt" \
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$assisted_mmi" "\$slice" \
+    > "$run_dir/assisted-\${reads}.paf" 2> "$run_dir/assisted-\${reads}.stderr.txt"
+  end_ns=\$(date +%s%N)
+  assisted_ms=\$(((end_ns - start_ns) / 1000000))
+
+  scripts/quant-lab score-translated-paf "$run_dir/baseline-\${reads}.paf" "$run_dir/assisted-\${reads}.paf" \
+    > "$run_dir/parity-\${reads}.tsv"
+  baseline_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/baseline-\${reads}.time.txt")
+  assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-\${reads}.time.txt")
+  baseline_alignments=\$(awk -F '\t' '\$1 == "baseline_alignments" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  assisted_alignments=\$(awk -F '\t' '\$1 == "assisted_alignments" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  mapped_recall=\$(awk -F '\t' '\$1 == "mapped_query_recall" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  coord_parity=\$(awk -F '\t' '\$1 == "coordinate_parity" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  speedup=\$(awk -v base="\$baseline_ms" -v assisted="\$assisted_ms" 'BEGIN { if (assisted > 0) printf "%.3f", base / assisted; else print "NA" }')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "\$reads" "\$baseline_ms" "\$assisted_ms" "\$speedup" "\$baseline_rss" "\$assisted_rss" \
+    "\$baseline_alignments" "\$assisted_alignments" "\$mapped_recall" "\$coord_parity" >> "$run_dir/scale.tsv"
+done
+cat "$run_dir/scale.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_minimap2_assisted_cached_bundle_scale_ecoli)
+      prepare_assisted_minimap2_bundle > "$run_dir/cache-manifest.tsv"
+      cache_dir="$(assisted_minimap2_bundle_cache_dir)"
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+source_reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+full_mmi="$lab_root/data/indexes/minimap2/genomes.sr.mmi"
+assisted_mmi="$cache_dir/candidate-reference.mmi"
+printf 'reads\tbaseline_ms\tassisted_ms\tspeedup\tbaseline_rss_kb\tassisted_rss_kb\tbaseline_alignments\tassisted_alignments\tmapped_query_recall\tcoordinate_parity\n' > "$run_dir/scale.tsv"
+for reads in 100 1000 3000 10000; do
+  slice="$run_dir/reads-\${reads}.fastq"
+  if [ "\$reads" = "10000" ]; then
+    slice="\$source_reads"
+  else
+    awk -v max_lines="\$((reads * 4))" 'NR <= max_lines { print }' "\$source_reads" > "\$slice"
+  fi
+
+  start_ns=\$(date +%s%N)
+  /usr/bin/time -v -o "$run_dir/baseline-\${reads}.time.txt" \
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$full_mmi" "\$slice" \
+    > "$run_dir/baseline-\${reads}.paf" 2> "$run_dir/baseline-\${reads}.stderr.txt"
+  end_ns=\$(date +%s%N)
+  baseline_ms=\$(((end_ns - start_ns) / 1000000))
+
+  start_ns=\$(date +%s%N)
+  /usr/bin/time -v -o "$run_dir/assisted-\${reads}.time.txt" \
+    "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$assisted_mmi" "\$slice" \
+    > "$run_dir/assisted-\${reads}.paf" 2> "$run_dir/assisted-\${reads}.stderr.txt"
+  end_ns=\$(date +%s%N)
+  assisted_ms=\$(((end_ns - start_ns) / 1000000))
+
+  scripts/quant-lab score-translated-paf "$run_dir/baseline-\${reads}.paf" "$run_dir/assisted-\${reads}.paf" \
+    > "$run_dir/parity-\${reads}.tsv"
+  baseline_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/baseline-\${reads}.time.txt")
+  assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-\${reads}.time.txt")
+  baseline_alignments=\$(awk -F '\t' '\$1 == "baseline_alignments" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  assisted_alignments=\$(awk -F '\t' '\$1 == "assisted_alignments" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  mapped_recall=\$(awk -F '\t' '\$1 == "mapped_query_recall" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  coord_parity=\$(awk -F '\t' '\$1 == "coordinate_parity" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
+  speedup=\$(awk -v base="\$baseline_ms" -v assisted="\$assisted_ms" 'BEGIN { if (assisted > 0) printf "%.3f", base / assisted; else print "NA" }')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "\$reads" "\$baseline_ms" "\$assisted_ms" "\$speedup" "\$baseline_rss" "\$assisted_rss" \
+    "\$baseline_alignments" "\$assisted_alignments" "\$mapped_recall" "\$coord_parity" >> "$run_dir/scale.tsv"
+done
+cat "$run_dir/scale.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_minimap2_assisted_bundle_optimizer_ecoli)
+      DINO_QUANT_TUNE_RUN_DIR="$run_dir" tune_assisted_minimap2_bundle
+      ;;
+    quant_minimap2_assisted_bundle_cold_warm_ecoli)
+      prepare_minimap2_bundle_index >/dev/null
+      prepare_read_slices >/dev/null
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+ref="$lab_root/data/prepared/genomes.fna"
+full_mmi="$lab_root/data/indexes/minimap2/genomes.sr.mmi"
+printf 'stage\telapsed_ms\trss_kb\trows_or_bases\n' > "$run_dir/cold-warm.tsv"
+start_ns=\$(date +%s%N)
+/usr/bin/time -v -o "$run_dir/baseline.time.txt" \
+  "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "\$full_mmi" "\$reads" \
+  > "$run_dir/baseline.paf" 2> "$run_dir/baseline.stderr.txt"
+end_ns=\$(date +%s%N)
+baseline_ms=\$(((end_ns - start_ns) / 1000000))
+baseline_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/baseline.time.txt")
+printf 'baseline_cached_full_mmi\t%s\t%s\t%s\n' "\$baseline_ms" "\$baseline_rss" "\$(wc -l < "$run_dir/baseline.paf")" >> "$run_dir/cold-warm.tsv"
+
+start_ns=\$(date +%s%N)
+cargo run -p dino-quant --release -- emit-candidates "\$ref" "\$reads" \
+  --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+  --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+  --reference-cache "$run_dir/reference-index.dqmi" --max-reads 10000 \
+  > "$run_dir/candidates.tsv" 2> "$run_dir/candidates.stderr.txt"
+end_ns=\$(date +%s%N)
+candidate_ms=\$(((end_ns - start_ns) / 1000000))
+printf 'dino_quant_candidates\t%s\tNA\t%s\n' "\$candidate_ms" "\$((\$(wc -l < "$run_dir/candidates.tsv") - 1))" >> "$run_dir/cold-warm.tsv"
+
+start_ns=\$(date +%s%N)
+cargo run -p dino-quant --release -- emit-candidates "\$ref" "\$reads" \
+  --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+  --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+  --reference-cache "$run_dir/reference-index.dqmi" --max-reads 10000 \
+  > "$run_dir/candidates-cache-hit.tsv" 2> "$run_dir/candidates-cache-hit.stderr.txt"
+end_ns=\$(date +%s%N)
+candidate_cache_hit_ms=\$(((end_ns - start_ns) / 1000000))
+printf 'dino_quant_candidates_cache_hit\t%s\tNA\t%s\n' "\$candidate_cache_hit_ms" "\$((\$(wc -l < "$run_dir/candidates-cache-hit.tsv") - 1))" >> "$run_dir/cold-warm.tsv"
+
+start_ns=\$(date +%s%N)
+cargo run -p dino-quant --release -- emit-candidate-reference "\$ref" "$run_dir/candidates.tsv" \
+  --padding 64 --merge-gap 32 --mask-reference \
+  > "$run_dir/candidate-reference.fna" 2> "$run_dir/candidate-reference.stderr.txt"
+end_ns=\$(date +%s%N)
+mask_ms=\$(((end_ns - start_ns) / 1000000))
+unmasked=\$(awk '!/^>/ { line=\$0; gsub(/N/, "", line); bases += length(line) } END { print bases + 0 }' "$run_dir/candidate-reference.fna")
+printf 'dino_quant_mask_reference\t%s\tNA\t%s\n' "\$mask_ms" "\$unmasked" >> "$run_dir/cold-warm.tsv"
+
+start_ns=\$(date +%s%N)
+/usr/bin/time -v -o "$run_dir/assisted-index.time.txt" \
+  "$lab_root/tools/minimap2/minimap2" -x sr -d "$run_dir/candidate-reference.mmi" "$run_dir/candidate-reference.fna" \
+  > "$run_dir/assisted-index.stdout.txt" 2> "$run_dir/assisted-index.stderr.txt"
+end_ns=\$(date +%s%N)
+index_ms=\$(((end_ns - start_ns) / 1000000))
+index_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-index.time.txt")
+printf 'assisted_build_mmi\t%s\t%s\t%s\n' "\$index_ms" "\$index_rss" "\$(stat -c %s "$run_dir/candidate-reference.mmi")" >> "$run_dir/cold-warm.tsv"
+
+start_ns=\$(date +%s%N)
+/usr/bin/time -v -o "$run_dir/assisted-map.time.txt" \
+  "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" "$run_dir/candidate-reference.mmi" "\$reads" \
+  > "$run_dir/assisted.paf" 2> "$run_dir/assisted-map.stderr.txt"
+end_ns=\$(date +%s%N)
+assisted_ms=\$(((end_ns - start_ns) / 1000000))
+assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-map.time.txt")
+printf 'assisted_warm_map\t%s\t%s\t%s\n' "\$assisted_ms" "\$assisted_rss" "\$(wc -l < "$run_dir/assisted.paf")" >> "$run_dir/cold-warm.tsv"
+
+scripts/quant-lab score-translated-paf "$run_dir/baseline.paf" "$run_dir/assisted.paf" > "$run_dir/parity.tsv"
+{
+  cat "$run_dir/cold-warm.tsv"
+  awk 'NR > 1 { print }' "$run_dir/parity.tsv"
+} > "$run_dir/cold-warm-summary.tsv"
+cat "$run_dir/cold-warm-summary.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    quant_dino_seq_chunk_sweep_candidates_bundle)
+      prepare_minimap2_bundle_index >/dev/null
+      prepare_read_slices >/dev/null
+      cat > "$run_dir/run.sh" <<RUN
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$repo_root"
+reads="$lab_root/data/prepared/SRR001666_1.10k.fastq"
+ref="$lab_root/data/prepared/genomes.fna"
+printf 'chunk_bytes\telapsed_ms\tcandidate_rows\tavg_considered\tread_qps\n' > "$run_dir/chunk-sweep.tsv"
+cargo run -p dino-quant --release -- emit-candidates "\$ref" "\$reads" \
+  --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+  --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+  --reference-cache "$run_dir/reference-index.dqmi" --max-reads 1 \
+  > "$run_dir/prewarm-candidates.tsv" 2> "$run_dir/prewarm-candidates.stderr.txt"
+for chunk_bytes in 262144 1048576 4194304 8388608; do
+  start_ns=\$(date +%s%N)
+  DINO_QUANT_FASTQ_CHUNK_BYTES="\$chunk_bytes" cargo run -p dino-quant --release -- emit-candidates "\$ref" "\$reads" \
+    --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
+    --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+    --reference-cache "$run_dir/reference-index.dqmi" --max-reads 10000 \
+    > "$run_dir/candidates-\${chunk_bytes}.tsv" 2> "$run_dir/candidates-\${chunk_bytes}.stderr.txt"
+  end_ns=\$(date +%s%N)
+  elapsed_ms=\$(((end_ns - start_ns) / 1000000))
+  rows=\$((\$(wc -l < "$run_dir/candidates-\${chunk_bytes}.tsv") - 1))
+  avg=\$(awk 'match(\$0, /avg_considered=([0-9.]+)/) { print substr(\$0, RSTART + 15, RLENGTH - 15) }' "$run_dir/candidates-\${chunk_bytes}.stderr.txt")
+  qps=\$(awk 'match(\$0, /read_qps=([0-9.]+)/) { print substr(\$0, RSTART + 9, RLENGTH - 9) }' "$run_dir/candidates-\${chunk_bytes}.stderr.txt")
+  printf '%s\t%s\t%s\t%s\t%s\n' "\$chunk_bytes" "\$elapsed_ms" "\$rows" "\${avg:-NA}" "\${qps:-NA}" >> "$run_dir/chunk-sweep.tsv"
+done
+cat "$run_dir/chunk-sweep.tsv"
+RUN
+      chmod +x "$run_dir/run.sh"
+      run_timed "$run_dir" bash "$run_dir/run.sh"
+      ;;
+    baseline_minimap2_ecoli)
+      acquire ecoli_mg1655_ref >/dev/null
+      prepare_read_slices >/dev/null
+      run_timed "$run_dir" "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+        "$(dataset_path ecoli_mg1655_ref)" "$lab_root/data/prepared/SRR001666_1.10k.fastq"
+      ;;
+    baseline_minimap2_cached_ecoli)
+      prepare_read_slices >/dev/null
+      [ -f "$lab_root/data/indexes/minimap2/ecoli_mg1655.sr.mmi" ] || prepare_one minimap2
+      run_timed "$run_dir" "$lab_root/tools/minimap2/minimap2" -x sr -t "$bench_threads" \
+        "$lab_root/data/indexes/minimap2/ecoli_mg1655.sr.mmi" \
+        "$lab_root/data/prepared/SRR001666_1.10k.fastq"
+      ;;
+    baseline_bowtie2_ecoli)
+      prepare_read_slices >/dev/null
+      [ -f "$lab_root/data/indexes/bowtie2/ecoli_mg1655.1.bt2" ] || prepare_one bowtie2
+      run_timed "$run_dir" "$lab_root/tools/bowtie2/bowtie2" --reorder -p "$bench_threads" \
+        -x "$lab_root/data/indexes/bowtie2/ecoli_mg1655" \
+        -U "$lab_root/data/prepared/SRR001666_1.10k.fastq"
+      ;;
+    baseline_sourmash_ecoli)
+      [ -f "$lab_root/data/signatures/genomes.sig" ] || prepare_one sourmash
+      [ -f "$lab_root/data/signatures/ecoli_mg1655.sig" ] || prepare_one sourmash
+      run_timed "$run_dir" "$lab_root/tools/sourmash/.venv/bin/sourmash" search \
+        "$lab_root/data/signatures/ecoli_mg1655.sig" "$lab_root/data/signatures/genomes.sig" \
+        --containment -k 31 -o "$run_dir/search.csv"
+      ;;
+    baseline_spades_ecoli)
+      prepare_read_slices >/dev/null
+      run_timed "$run_dir" "$lab_root/tools/spades/bin/spades.py" --only-error-correction \
+        -t "$bench_threads" -m 32 \
+        -1 "$lab_root/data/prepared/SRR001666_1.10k.fastq" \
+        -2 "$lab_root/data/prepared/SRR001666_2.10k.fastq" \
+        -o "$run_dir/spades"
+      ;;
+    baseline_diamond_ecoli)
+      [ -f "$lab_root/data/indexes/diamond/proteins.dmnd" ] || prepare_one diamond
+      acquire ecoli_mg1655_protein >/dev/null
+      run_timed "$run_dir" "$lab_root/tools/diamond/build/diamond" blastp \
+        --threads "$bench_threads" \
+        --db "$lab_root/data/indexes/diamond/proteins" \
+        --query "$(dataset_path ecoli_mg1655_protein)" \
+        --outfmt 6 qseqid sseqid pident length evalue bitscore \
+        --out "$run_dir/diamond.tsv"
+      ;;
+    *)
+      printf 'no command implemented for matrix row: %s\n' "$matrix_id" >&2
+      exit 2
+      ;;
+  esac
+
+  printf 'run_dir\t%s\n' "$run_dir"
+}
+
+run_suite() {
+  local filter="${1:-ready}"
+  awk -F '\t' -v filter="$filter" '
+    NR == 1 { next }
+    filter == "all" { print $1; next }
+    filter == "ready" && $7 == "ready" { print $1; next }
+    filter == "smoke" && $3 == "smoke" { print $1; next }
+  ' "$repo_root/lab/matrix.tsv" |
+    while IFS= read -r matrix_id; do
+      printf 'run\t%s\n' "$matrix_id"
+      run_matrix "$matrix_id"
+    done
+}
+
+summarize() {
+  printf 'run_id\tmatrix_id\ttool\tstage\tthreads\twall_time\tmax_rss_kb\trun_dir\n'
+  find "$lab_root/runs" -mindepth 1 -maxdepth 1 -type d | sort |
+    while IFS= read -r run_dir; do
+      [ -f "$run_dir/metadata.tsv" ] || continue
+      run_id="$(basename "$run_dir")"
+      matrix_id="$(awk -F '\t' '$1 == "matrix_id" { print $2 }' "$run_dir/metadata.tsv")"
+      awk -F '\t' -v id="$matrix_id" 'NR > 1 && $1 == id { found = 1 } END { exit !found }' \
+        "$repo_root/lab/matrix.tsv" || continue
+      if [ "${DINO_QUANT_SHOW_FAILED:-0}" != "1" ]; then
+        awk -F ': ' 'index($0, "Exit status") && $NF == "0" { found = 1 } END { exit !found }' \
+          "$run_dir/time.txt" 2>/dev/null || continue
+      fi
+      tool="$(awk -F '\t' '$1 == "tool" { print $2 }' "$run_dir/metadata.tsv")"
+      stage="$(awk -F '\t' '$1 == "stage" { print $2 }' "$run_dir/metadata.tsv")"
+      threads="$(awk -F '\t' '$1 == "threads" { print $2 }' "$run_dir/metadata.tsv")"
+      wall="$(awk -F ': ' 'index($0, "Elapsed (wall clock) time") { print $NF }' "$run_dir/time.txt" 2>/dev/null || true)"
+      rss="$(awk -F ': ' 'index($0, "Maximum resident set size") { print $NF }' "$run_dir/time.txt" 2>/dev/null || true)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$run_id" "$matrix_id" "$tool" "$stage" "$threads" "${wall:-NA}" "${rss:-NA}" "$run_dir"
+    done
+}
+
+case "${1:-}" in
+  init)
+    init_lab
+    ;;
+  paths)
+    printf 'lab_root\t%s\n' "$lab_root"
+    printf 'tools\t%s/tools\n' "$lab_root"
+    printf 'runs\t%s/runs\n' "$lab_root"
+    printf 'data\t%s/data\n' "$lab_root"
+    printf 'build_logs\t%s/build-logs\n' "$lab_root"
+    printf 'patches\t%s/patches\n' "$lab_root"
+    ;;
+  acquire)
+    shift
+    acquire "$@"
+    ;;
+  prepare)
+    shift
+    prepare_one "$@"
+    ;;
+  prepare-assisted-minimap2)
+    prepare_assisted_minimap2
+    ;;
+  prepare-assisted-minimap2-bundle-config)
+    shift
+    prepare_assisted_minimap2_bundle_config "$@"
+    ;;
+  tune-assisted-minimap2-bundle)
+    tune_assisted_minimap2_bundle
+    ;;
+  new-run)
+    shift
+    new_run "$@"
+    ;;
+  run)
+    shift
+    run_matrix "$@"
+    ;;
+  run-suite)
+    shift
+    run_suite "$@"
+    ;;
+  score-minimap2-candidates)
+    shift
+    score_minimap2_candidates "$@"
+    ;;
+  score-translated-paf)
+    shift
+    score_translated_paf "$@"
+    ;;
+  optimize-retrieval)
+    shift
+    optimize_retrieval "$@"
+    ;;
+  summarize)
+    summarize
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

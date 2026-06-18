@@ -1,0 +1,10 @@
+data_id	kind	url	bytes	md5	external_path	notes
+ecoli_mg1655_ref	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz	-	-	data/refs/ecoli_mg1655.fna.gz	E. coli K-12 MG1655 RefSeq genome
+ecoli_mg1655_protein	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_protein.faa.gz	-	-	data/proteins/ecoli_mg1655.faa.gz	E. coli K-12 MG1655 RefSeq proteins
+salmonella_lt2_ref	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/945/GCF_000006945.2_ASM694v2/GCF_000006945.2_ASM694v2_genomic.fna.gz	-	-	data/refs/salmonella_lt2.fna.gz	Salmonella enterica LT2 decoy genome
+salmonella_lt2_protein	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/945/GCF_000006945.2_ASM694v2/GCF_000006945.2_ASM694v2_protein.faa.gz	-	-	data/proteins/salmonella_lt2.faa.gz	Salmonella enterica LT2 decoy proteins
+bacillus_168_ref	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/045/GCF_000009045.1_ASM904v1/GCF_000009045.1_ASM904v1_genomic.fna.gz	-	-	data/refs/bacillus_168.fna.gz	Bacillus subtilis 168 decoy genome
+bacillus_168_protein	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/045/GCF_000009045.1_ASM904v1/GCF_000009045.1_ASM904v1_protein.faa.gz	-	-	data/proteins/bacillus_168.faa.gz	Bacillus subtilis 168 decoy proteins
+pseudomonas_pao1_ref	fasta	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/765/GCF_000006765.1_ASM676v1/GCF_000006765.1_ASM676v1_genomic.fna.gz	-	-	data/refs/pseudomonas_pao1.fna.gz	Pseudomonas aeruginosa PAO1 decoy genome
+ecoli_srr001666_r1	fastq	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR001/SRR001666/SRR001666_1.fastq.gz	260786393	5adf40fe219dc0afdf56be037d3a3ff6	data/reads/SRR001666_1.fastq.gz	E. coli MG1655 Illumina paired-end R1
+ecoli_srr001666_r2	fastq	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR001/SRR001666/SRR001666_2.fastq.gz	292718968	9dd454e0fb0d25f0f001cb1b1cadb544	data/reads/SRR001666_2.fastq.gz	E. coli MG1655 Illumina paired-end R2

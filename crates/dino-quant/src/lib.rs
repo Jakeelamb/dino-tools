@@ -69,6 +69,37 @@ pub struct QuantizedVector {
     qjl_residual: Option<QjlResidual>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PreparedQuantizedQuery {
+    dim: usize,
+    rotation_seed: u64,
+    qjl_seed: Option<u64>,
+    rotated: Vec<f32>,
+    rotated_sum: f32,
+    scalar_4bit_lookup: Vec<[f32; 256]>,
+    rotated_qjl: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantizedVectorSnapshot {
+    pub dim: usize,
+    pub bits: u8,
+    pub clip: f32,
+    pub rotation_seed: u64,
+    pub codes_data: Vec<u8>,
+    pub codes_len: usize,
+    pub codes_bits: u8,
+    pub qjl_residual: Option<QjlResidualSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QjlResidualSnapshot {
+    pub signs: Vec<u64>,
+    pub dim: usize,
+    pub norm: f32,
+    pub seed: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReconstructionMetrics {
     pub mse: f32,
@@ -99,6 +130,9 @@ pub struct ReferenceIndexConfig {
 
 #[derive(Clone, Debug)]
 pub struct SearchHit {
+    pub target_name: String,
+    pub target_start: usize,
+    pub target_end: usize,
     pub start: usize,
     pub end: usize,
     pub score: f32,
@@ -112,6 +146,9 @@ pub struct ReferenceWindowIndex {
 
 #[derive(Clone, Debug)]
 struct ReferenceWindow {
+    target_name: String,
+    target_start: usize,
+    target_end: usize,
     start: usize,
     end: usize,
     sketch: QuantizedVector,
@@ -164,6 +201,106 @@ impl QuantizerConfig {
 }
 
 impl QuantizedVector {
+    pub fn prepare_approximate_query(
+        query: &[f32],
+        rotation_seed: u64,
+        qjl_seed: Option<u64>,
+    ) -> Result<PreparedQuantizedQuery, String> {
+        let rotated = rotate(query, rotation_seed)?;
+        let rotated_sum = rotated.iter().sum();
+        let scalar_4bit_lookup = build_4bit_lookup(&rotated);
+        let rotated_qjl = qjl_seed.map(|seed| rotate(query, seed)).transpose()?;
+        Ok(PreparedQuantizedQuery {
+            dim: query.len(),
+            rotation_seed,
+            qjl_seed,
+            rotated,
+            rotated_sum,
+            scalar_4bit_lookup,
+            rotated_qjl,
+        })
+    }
+
+    pub fn snapshot(&self) -> QuantizedVectorSnapshot {
+        QuantizedVectorSnapshot {
+            dim: self.dim,
+            bits: self.bits,
+            clip: self.clip,
+            rotation_seed: self.rotation_seed,
+            codes_data: self.codes.data.clone(),
+            codes_len: self.codes.len,
+            codes_bits: self.codes.bits,
+            qjl_residual: self
+                .qjl_residual
+                .as_ref()
+                .map(|residual| QjlResidualSnapshot {
+                    signs: residual.signs.clone(),
+                    dim: residual.dim,
+                    norm: residual.norm,
+                    seed: residual.seed,
+                }),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: QuantizedVectorSnapshot) -> Result<Self, String> {
+        if snapshot.dim == 0 || !snapshot.dim.is_power_of_two() {
+            return Err(
+                "quantized vector snapshot dimension must be a non-zero power of two".to_owned(),
+            );
+        }
+        if snapshot.codes_len != snapshot.dim {
+            return Err("quantized vector snapshot code length must match dimension".to_owned());
+        }
+        if !(1..=8).contains(&snapshot.bits) || !(1..=8).contains(&snapshot.codes_bits) {
+            return Err("quantized vector snapshot bits must be in 1..=8".to_owned());
+        }
+        if snapshot.bits != snapshot.codes_bits {
+            return Err("quantized vector snapshot code bits mismatch".to_owned());
+        }
+        if !snapshot.clip.is_finite() || snapshot.clip <= 0.0 {
+            return Err("quantized vector snapshot clip must be finite and positive".to_owned());
+        }
+        let expected_code_bytes =
+            (snapshot.codes_len * usize::from(snapshot.codes_bits)).div_ceil(8);
+        if snapshot.codes_data.len() != expected_code_bytes {
+            return Err("quantized vector snapshot code byte length mismatch".to_owned());
+        }
+        let qjl_residual = snapshot
+            .qjl_residual
+            .map(|residual| {
+                if residual.dim != snapshot.dim {
+                    return Err(
+                        "QJL snapshot dimension must match quantized vector dimension".to_owned(),
+                    );
+                }
+                if residual.signs.len() != residual.dim.div_ceil(64) {
+                    return Err("QJL snapshot sign word length mismatch".to_owned());
+                }
+                if !residual.norm.is_finite() || residual.norm <= 0.0 {
+                    return Err("QJL snapshot norm must be finite and positive".to_owned());
+                }
+                Ok(QjlResidual {
+                    signs: residual.signs,
+                    dim: residual.dim,
+                    norm: residual.norm,
+                    seed: residual.seed,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            dim: snapshot.dim,
+            bits: snapshot.bits,
+            clip: snapshot.clip,
+            rotation_seed: snapshot.rotation_seed,
+            codes: PackedCodes {
+                data: snapshot.codes_data,
+                len: snapshot.codes_len,
+                bits: snapshot.codes_bits,
+            },
+            qjl_residual,
+        })
+    }
+
     pub fn decode(&self) -> Result<Vec<f32>, String> {
         if self.codes.len() != self.dim {
             return Err("quantized code length does not match dimension".to_owned());
@@ -252,6 +389,47 @@ impl QuantizedVector {
         if let Some(residual) = &self.qjl_residual {
             let rotated_residual_query = rotate(query, residual.seed)?;
             score += residual.dot_rotated_query(&rotated_residual_query)?;
+        }
+        Ok(score)
+    }
+
+    pub fn approximate_dot_prepared_query(
+        &self,
+        query: &PreparedQuantizedQuery,
+    ) -> Result<f32, String> {
+        if query.dim != self.dim {
+            return Err("prepared query dimension does not match quantized vector".to_owned());
+        }
+        if query.rotation_seed != self.rotation_seed {
+            return Err("prepared query rotation seed does not match quantized vector".to_owned());
+        }
+        let rotated_qjl = if let Some(residual) = &self.qjl_residual {
+            if query.qjl_seed != Some(residual.seed) {
+                return Err("prepared query QJL seed does not match residual".to_owned());
+            }
+            Some(
+                query
+                    .rotated_qjl
+                    .as_deref()
+                    .ok_or_else(|| "prepared query is missing QJL rotation".to_owned())?,
+            )
+        } else {
+            None
+        };
+        if self.bits == 4 {
+            return self.approximate_dot_4bit_lookup(
+                &query.scalar_4bit_lookup,
+                query.rotated_sum,
+                rotated_qjl,
+            );
+        }
+        let mut score =
+            self.scalar_dot_rotated_query_with_sum(&query.rotated, query.rotated_sum)?;
+        if let Some(residual) = &self.qjl_residual {
+            let Some(rotated_qjl) = rotated_qjl else {
+                return Err("prepared query is missing QJL rotation".to_owned());
+            };
+            score += residual.dot_rotated_query(rotated_qjl)?;
         }
         Ok(score)
     }
@@ -457,7 +635,64 @@ impl ReferenceWindowIndex {
             let end = start + config.window_len;
             let sketch = dna_kmer_sketch(&reference[start..end], config.k, config.dim)?;
             let sketch = config.quantizer.encode(&sketch)?;
-            windows.push(ReferenceWindow { start, end, sketch });
+            windows.push(ReferenceWindow {
+                target_name: "reference".to_owned(),
+                target_start: start,
+                target_end: end,
+                start,
+                end,
+                sketch,
+            });
+        }
+
+        Ok(Self { config, windows })
+    }
+
+    pub fn build_records(
+        records: &[SequenceRecord],
+        config: ReferenceIndexConfig,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        if records.is_empty() {
+            return Err("at least one sequence record is required".to_owned());
+        }
+
+        let mut windows = Vec::new();
+        let mut linear_offset = 0_usize;
+        for (idx, record) in records.iter().enumerate() {
+            if record.bases.len() >= config.window_len {
+                let window_count = ((record.bases.len() - config.window_len) / config.stride) + 1;
+                windows.reserve(window_count);
+                for target_start in
+                    (0..=record.bases.len() - config.window_len).step_by(config.stride)
+                {
+                    let target_end = target_start + config.window_len;
+                    let sketch = dna_kmer_sketch(
+                        &record.bases[target_start..target_end],
+                        config.k,
+                        config.dim,
+                    )?;
+                    let sketch = config.quantizer.encode(&sketch)?;
+                    let start = linear_offset + target_start;
+                    let end = linear_offset + target_end;
+                    windows.push(ReferenceWindow {
+                        target_name: record.name.clone(),
+                        target_start,
+                        target_end,
+                        start,
+                        end,
+                        sketch,
+                    });
+                }
+            }
+            linear_offset += record.bases.len();
+            if idx + 1 < records.len() {
+                linear_offset += 1;
+            }
+        }
+
+        if windows.is_empty() {
+            return Err("no reference record is long enough for the configured window".to_owned());
         }
 
         Ok(Self { config, windows })
@@ -505,6 +740,9 @@ impl ReferenceWindowIndex {
                 &mut top,
                 top_k,
                 SearchHit {
+                    target_name: window.target_name.clone(),
+                    target_start: window.target_start,
+                    target_end: window.target_end,
                     start: window.start,
                     end: window.end,
                     score,
@@ -534,6 +772,9 @@ impl ReferenceWindowIndex {
                 &mut top,
                 top_k,
                 SearchHit {
+                    target_name: window.target_name.clone(),
+                    target_start: window.target_start,
+                    target_end: window.target_end,
                     start: window.start,
                     end: window.end,
                     score,
@@ -671,6 +912,30 @@ pub fn dna_kmer_sketch(seq: &[u8], k: usize, dim: usize) -> Result<Vec<f32>, Str
     Ok(sketch)
 }
 
+pub fn protein_kmer_sketch(seq: &[u8], k: usize, dim: usize) -> Result<Vec<f32>, String> {
+    if k == 0 || k > 16 {
+        return Err("protein k must be in 1..=16".to_owned());
+    }
+    if dim == 0 {
+        return Err("sketch dimension must be non-zero".to_owned());
+    }
+    if seq.len() < k {
+        return Ok(vec![0.0; dim]);
+    }
+
+    let mut sketch = vec![0.0_f32; dim];
+    for window in seq.windows(k) {
+        if let Some(code) = protein_kmer_code(window) {
+            let hash = mix_u64(code ^ ((k as u64) << 56));
+            let bucket = (hash as usize) % dim;
+            let sign = if (hash >> 63) == 0 { 1.0 } else { -1.0 };
+            sketch[bucket] += sign;
+        }
+    }
+    l2_normalize(&mut sketch);
+    Ok(sketch)
+}
+
 #[cfg(test)]
 fn parse_fasta_bytes(input: &[u8]) -> Result<Vec<SequenceRecord>, String> {
     let mut records = Vec::new();
@@ -721,6 +986,37 @@ pub fn read_fasta_file(path: impl AsRef<Path>) -> Result<Vec<SequenceRecord>, St
     Ok(records)
 }
 
+pub fn read_protein_fasta_file(path: impl AsRef<Path>) -> Result<Vec<SequenceRecord>, String> {
+    let path = path.as_ref();
+    let mut reader = dino_seq::open_fasta(path).map_err(|err| {
+        format!(
+            "failed to open protein FASTA with dino-seq {}: {err}",
+            path.display()
+        )
+    })?;
+    let mut records = Vec::new();
+    reader
+        .visit_records(|record| {
+            let mut bases = Vec::with_capacity(record.seq().len());
+            append_protein_line(record.seq(), &mut bases).map_err(dino_seq_format_error)?;
+            records.push(SequenceRecord {
+                name: parse_record_name(record.name_without_gt()).map_err(dino_seq_format_error)?,
+                bases,
+            });
+            Ok(())
+        })
+        .map_err(|err| {
+            format!(
+                "failed to parse protein FASTA with dino-seq {}: {err}",
+                path.display()
+            )
+        })?;
+    if records.is_empty() {
+        return Err("protein FASTA input did not contain any records".to_owned());
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 fn parse_fastq_bytes(input: &[u8]) -> Result<Vec<SequenceRecord>, String> {
     let mut records = Vec::new();
@@ -750,6 +1046,14 @@ pub fn visit_fastq_slices_file(
     path: impl AsRef<Path>,
     visitor: impl FnMut(SequenceRecordRef<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
+    visit_fastq_slices_file_limit(path, None, visitor)
+}
+
+pub fn visit_fastq_slices_file_limit(
+    path: impl AsRef<Path>,
+    max_records: Option<usize>,
+    visitor: impl FnMut(SequenceRecordRef<'_>) -> Result<(), String>,
+) -> Result<(), String> {
     let path = path.as_ref();
     let mut reader = dino_seq::open_fastq(path).map_err(|err| {
         format!(
@@ -757,7 +1061,7 @@ pub fn visit_fastq_slices_file(
             path.display()
         )
     })?;
-    visit_fastq_slices_with_reader(&mut reader, visitor).map_err(|err| {
+    visit_fastq_slices_with_reader(&mut reader, max_records, visitor).map_err(|err| {
         format!(
             "failed to parse FASTQ with dino-seq {}: {err}",
             path.display()
@@ -767,28 +1071,38 @@ pub fn visit_fastq_slices_file(
 
 fn visit_fastq_slices_with_reader<R: Read>(
     reader: &mut dino_seq::FastqReader<R>,
+    max_records: Option<usize>,
     mut visitor: impl FnMut(SequenceRecordRef<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let chunk_config = dino_seq::FastqChunkConfig::new(4 * 1024 * 1024).min_records(1);
+    let chunk_bytes = std::env::var("DINO_QUANT_FASTQ_CHUNK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(4 * 1024 * 1024);
+    let chunk_config = dino_seq::FastqChunkConfig::new(chunk_bytes).min_records(1);
     let mut records = 0_usize;
-    while reader
-        .next_chunk_with_sink(chunk_config, &mut |record: dino_seq::FastqVisitRecord<
-            '_,
-        >| {
-            let header = record.name();
-            let name = header.strip_prefix(b"@").unwrap_or(header);
-            let name = parse_record_name_bytes(name).map_err(dino_seq_format_error)?;
-            validate_sequence_bases(record.seq()).map_err(dino_seq_format_error)?;
-            visitor(SequenceRecordRef {
-                name,
-                bases: record.seq(),
+    while max_records.is_none_or(|limit| records < limit)
+        && reader
+            .next_chunk_with_sink(chunk_config, &mut |record: dino_seq::FastqVisitRecord<
+                '_,
+            >| {
+                if max_records.is_some_and(|limit| records >= limit) {
+                    return Ok(());
+                }
+                let header = record.name();
+                let name = header.strip_prefix(b"@").unwrap_or(header);
+                let name = parse_record_name_bytes(name).map_err(dino_seq_format_error)?;
+                validate_sequence_bases(record.seq()).map_err(dino_seq_format_error)?;
+                visitor(SequenceRecordRef {
+                    name,
+                    bases: record.seq(),
+                })
+                .map_err(dino_seq_format_error)?;
+                records += 1;
+                Ok(())
             })
-            .map_err(dino_seq_format_error)?;
-            records += 1;
-            Ok(())
-        })
-        .map_err(|err| err.to_string())?
-        .is_some()
+            .map_err(|err| err.to_string())?
+            .is_some()
     {}
     if records == 0 {
         return Err("FASTQ input did not contain any records".to_owned());
@@ -1020,6 +1334,23 @@ fn append_sequence_line(line: &[u8], dst: &mut Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+fn append_protein_line(line: &[u8], dst: &mut Vec<u8>) -> Result<(), String> {
+    for residue in line {
+        let upper = residue.to_ascii_uppercase();
+        match upper {
+            b'A'..=b'Z' | b'*' | b'-' => dst.push(upper),
+            b' ' | b'\t' | b'\r' => {}
+            other => {
+                return Err(format!(
+                    "unsupported protein sequence character '{}' in input",
+                    char::from(other)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_sequence_bases(line: &[u8]) -> Result<(), String> {
     for base in line {
         match base.to_ascii_uppercase() {
@@ -1033,6 +1364,42 @@ fn validate_sequence_bases(line: &[u8]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn protein_kmer_code(window: &[u8]) -> Option<u64> {
+    let mut code = 0_u64;
+    for residue in window {
+        code = code.checked_mul(23)?;
+        code = code.checked_add(u64::from(protein_code(*residue)?))?;
+    }
+    Some(code)
+}
+
+fn protein_code(residue: u8) -> Option<u8> {
+    match residue.to_ascii_uppercase() {
+        b'A' => Some(0),
+        b'C' => Some(1),
+        b'D' => Some(2),
+        b'E' => Some(3),
+        b'F' => Some(4),
+        b'G' => Some(5),
+        b'H' => Some(6),
+        b'I' => Some(7),
+        b'K' => Some(8),
+        b'L' => Some(9),
+        b'M' => Some(10),
+        b'N' => Some(11),
+        b'P' => Some(12),
+        b'Q' => Some(13),
+        b'R' => Some(14),
+        b'S' => Some(15),
+        b'T' => Some(16),
+        b'V' => Some(17),
+        b'W' => Some(18),
+        b'Y' => Some(19),
+        b'B' | b'J' | b'O' | b'U' | b'X' | b'Z' | b'*' | b'-' => None,
+        _ => None,
+    }
 }
 
 fn dino_seq_format_error(message: String) -> dino_seq::FastqError {
@@ -1171,6 +1538,14 @@ mod tests {
     }
 
     #[test]
+    fn protein_sketches_are_normalized_and_skip_ambiguous_residues() -> Result<(), String> {
+        let sketch = protein_kmer_sketch(b"MKRISTXTTITTTITITTGNGAG", 3, 128)?;
+        let norm = l2_norm(&sketch);
+        assert!((norm - 1.0).abs() < 1.0e-5, "norm was {norm}");
+        Ok(())
+    }
+
+    #[test]
     fn parses_fasta_records_and_concatenates_with_separator() -> Result<(), String> {
         let records = parse_fasta_bytes(b">chr1 description\nacgt\nNN\n>chr2\nTTA\n")?;
         assert_eq!(records.len(), 2);
@@ -1189,6 +1564,32 @@ mod tests {
         assert_eq!(records[0].bases, b"ACGTN");
         assert_eq!(records[1].name, "read2");
         assert_eq!(records[1].bases, b"TTA");
+        Ok(())
+    }
+
+    #[test]
+    fn fastq_slice_visitor_can_stop_after_limit() -> Result<(), String> {
+        let input = b"@read1\nACGT\n+\nIIII\n@read2\nTTAA\n+\n####\n";
+        let mut reader = dino_seq::FastqReader::new(input.as_slice());
+        let mut names = Vec::new();
+        visit_fastq_slices_with_reader(&mut reader, Some(1), |record| {
+            names.push(String::from_utf8(record.name.to_vec()).map_err(|err| err.to_string())?);
+            Ok(())
+        })?;
+        assert_eq!(names, vec!["read1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_protein_fasta_records() -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("dino_quant_protein_{}.faa", std::process::id()));
+        std::fs::write(&path, b">p1 protein\nmkristX*\n").map_err(|err| err.to_string())?;
+        let records = read_protein_fasta_file(&path)?;
+        std::fs::remove_file(path).map_err(|err| err.to_string())?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "p1");
+        assert_eq!(records[0].bases, b"MKRISTX*");
         Ok(())
     }
 
@@ -1239,6 +1640,49 @@ mod tests {
     }
 
     #[test]
+    fn quantized_vector_snapshot_round_trips_scoring() -> Result<(), String> {
+        let reference = dna_kmer_sketch(&synthetic_dna(512, 19), 11, 128)?;
+        let query = dna_kmer_sketch(&mutate_dna(&synthetic_dna(512, 19), 7), 11, 128)?;
+        let quantized = QuantizerConfig {
+            bits: 4,
+            use_qjl_residual: true,
+            ..QuantizerConfig::default()
+        }
+        .encode(&reference)?;
+        let restored = QuantizedVector::from_snapshot(quantized.snapshot())?;
+
+        let original_score = quantized.approximate_dot_query(&query)?;
+        let restored_score = restored.approximate_dot_query(&query)?;
+        assert_eq!(original_score.to_bits(), restored_score.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_query_matches_direct_scoring() -> Result<(), String> {
+        let reference = dna_kmer_sketch(&synthetic_dna(512, 23), 11, 128)?;
+        let query = dna_kmer_sketch(&mutate_dna(&synthetic_dna(512, 23), 5), 11, 128)?;
+        let config = QuantizerConfig {
+            bits: 4,
+            use_qjl_residual: true,
+            ..QuantizerConfig::default()
+        };
+        let quantized = config.encode(&reference)?;
+        let prepared = QuantizedVector::prepare_approximate_query(
+            &query,
+            config.rotation_seed,
+            Some(config.qjl_seed),
+        )?;
+
+        let direct = quantized.approximate_dot_query(&query)?;
+        let reused = quantized.approximate_dot_prepared_query(&prepared)?;
+        assert!(
+            (direct - reused).abs() < 1.0e-5,
+            "direct={direct} reused={reused}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn compressed_index_finds_mutated_source_window() -> Result<(), String> {
         let reference = synthetic_dna(8192, 0xabc);
         let config = ReferenceIndexConfig {
@@ -1263,6 +1707,39 @@ mod tests {
                 .any(|hit| { intervals_overlap(hit.start, hit.end, source_start, source_end) })
         );
         assert!(index.compression_ratio() > 6.0);
+        Ok(())
+    }
+
+    #[test]
+    fn record_index_reports_target_coordinates() -> Result<(), String> {
+        let records = vec![
+            SequenceRecord {
+                name: "chr1".to_owned(),
+                bases: synthetic_dna(1024, 1),
+            },
+            SequenceRecord {
+                name: "chr2".to_owned(),
+                bases: synthetic_dna(1024, 2),
+            },
+        ];
+        let config = ReferenceIndexConfig {
+            k: 11,
+            dim: 128,
+            window_len: 256,
+            stride: 128,
+            quantizer: QuantizerConfig {
+                bits: 4,
+                use_qjl_residual: false,
+                ..QuantizerConfig::default()
+            },
+        };
+        let index = ReferenceWindowIndex::build_records(&records, config)?;
+        let query = records[1].bases[256..512].to_vec();
+        let hits = index.search_sequence(&query, 3)?;
+        assert!(hits.iter().any(|hit| {
+            hit.target_name == "chr2"
+                && intervals_overlap(hit.target_start, hit.target_end, 256, 512)
+        }));
         Ok(())
     }
 

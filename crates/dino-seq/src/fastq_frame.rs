@@ -32,49 +32,6 @@ impl RecordValidation {
     };
 }
 
-#[inline]
-pub(crate) fn line_start(newline_offsets: &[usize], line: usize) -> usize {
-    if line == 0 {
-        0
-    } else {
-        newline_offsets[line - 1] + 1
-    }
-}
-
-#[inline]
-pub(crate) fn line_bounds(bytes: &[u8], newline_offsets: &[usize], line: usize) -> (usize, usize) {
-    let start = line_start(newline_offsets, line);
-    let end = if line < newline_offsets.len() {
-        newline_offsets[line]
-    } else {
-        bytes.len()
-    };
-    (start, trim_cr_end(bytes, start, end))
-}
-
-#[inline]
-pub(crate) fn line<'a>(bytes: &'a [u8], newline_offsets: &[usize], line_index: usize) -> Line<'a> {
-    let (start, end) = line_bounds(bytes, newline_offsets, line_index);
-    Line {
-        bytes: &bytes[start..end],
-        start,
-    }
-}
-
-#[inline]
-pub(crate) fn record_lines<'a>(
-    bytes: &'a [u8],
-    newline_offsets: &[usize],
-    line_index: usize,
-) -> RecordLines<'a> {
-    RecordLines {
-        name: line(bytes, newline_offsets, line_index),
-        seq: line(bytes, newline_offsets, line_index + 1),
-        plus: line(bytes, newline_offsets, line_index + 2),
-        qual: line(bytes, newline_offsets, line_index + 3),
-    }
-}
-
 pub(crate) fn validate_record(
     record: RecordLines<'_>,
     base_offset: u64,

@@ -8,18 +8,17 @@ preserve correctness, reproducibility, and honest benchmark boundaries.
 Run focused checks while editing:
 
 ```bash
-cargo fmt --all -- --check
-RUSTFLAGS="-D warnings" cargo check --lib
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo test --all
-cargo package --allow-dirty --list
+cargo fmt --all --check
+cargo test -p dino-seq --no-default-features
+cargo test -p dino-seq --all-features
+cargo clippy -p dino-seq --all-targets --all-features -- -D warnings
+cargo package -p dino-seq --allow-dirty --list
 ```
 
-Use nightly only for explicitly nightly surfaces:
+Run the in-tree smoke benchmark when changing parser hot paths:
 
 ```bash
-cargo +nightly test --all-features
-cargo +nightly clippy --all-targets --all-features -- -D warnings
+cargo bench -p dino-seq --bench throughput --all-features -- --list
 ```
 
 ## Benchmark Claims

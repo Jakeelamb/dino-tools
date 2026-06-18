@@ -13,6 +13,7 @@ const REFERENCE_BATCH_RECORDS: usize = 16;
 const REFERENCE_READER_BUFFER_SIZE: usize = 256 * 1024;
 const REFERENCE_EXPECTED_SEQ_LEN: usize = 1024 * 1024;
 const TWO_LINE_STREAM_BUFFER_SIZE: usize = 64 * 1024;
+const INDEXED_FETCH_SCRATCH_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ByteRange {
@@ -651,8 +652,8 @@ fn copy_indexed_sequence_window<R: Read>(
             "FASTA index entry has zero line_width for non-empty range".into(),
         ));
     }
-    if scratch.is_empty() {
-        scratch.resize(8192, 0);
+    if scratch.len() < INDEXED_FETCH_SCRATCH_SIZE {
+        scratch.resize(INDEXED_FETCH_SCRATCH_SIZE, 0);
     }
     while len > 0 {
         let take = usize::try_from(len.min(scratch.len() as u64))
@@ -1278,8 +1279,8 @@ impl<R: Read> FastaReader<R> {
 
     /// Visit every FASTA record in the stream.
     ///
-    /// This is a convenience path for single-pass consumers. It uses the same
-    /// batching and multiline sequence folding as [`next_batch`](Self::next_batch).
+    /// This is a convenience path for single-pass consumers. It avoids the batch
+    /// record and identifier side tables used by [`next_batch`](Self::next_batch).
     pub fn visit_records<F>(&mut self, mut visit: F) -> Result<()>
     where
         F: FnMut(FastaVisitRecord<'_>) -> Result<()>,
@@ -1292,13 +1293,9 @@ impl<R: Read> FastaReader<R> {
     where
         S: FastaRecordSink,
     {
-        while let Some(batch) = self.next_batch()? {
-            for record in batch.records() {
-                sink.record(FastaVisitRecord {
-                    name: record.name(),
-                    seq: record.seq(),
-                })?;
-            }
+        while let Some(header) = self.next_header()? {
+            self.visit_record(header, sink)?;
+            self.record_index += 1;
         }
         Ok(())
     }
@@ -1355,6 +1352,42 @@ impl<R: Read> FastaReader<R> {
 
         stats.observe_sequence_parts(bases, first, last);
         Ok(())
+    }
+
+    fn visit_record<S>(&mut self, header: PendingHeader, sink: &mut S) -> Result<()>
+    where
+        S: FastaRecordSink,
+    {
+        let record_index = self.record_index;
+        self.bytes.clear();
+
+        loop {
+            let line_start = self.byte_offset;
+            let n = self.read_line()?;
+            if n == 0 {
+                self.eof = true;
+                break;
+            }
+            let trimmed = trim_line(&self.line);
+            if trimmed.starts_with(b">") {
+                validate_header(trimmed, line_start, record_index + 1)?;
+                self.pending_header = Some(PendingHeader {
+                    bytes: trimmed.to_vec(),
+                    byte_offset: line_start,
+                });
+                break;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            self.bytes.extend_from_slice(trimmed);
+        }
+
+        let _ = header.byte_offset;
+        sink.record(FastaVisitRecord {
+            name: &header.bytes,
+            seq: &self.bytes,
+        })
     }
 
     fn next_header(&mut self) -> Result<Option<PendingHeader>> {
@@ -1595,13 +1628,7 @@ pub fn build_fasta_index_bgzf<R: Read>(reader: R) -> Result<FastaIndex> {
 
     while let Some(block) = block_reader.next_block()? {
         bgzf_entries.push(block.index_entry());
-        for &byte in block.bytes() {
-            line.push(byte);
-            if byte == b'\n' {
-                builder.observe_physical_line(&line)?;
-                line.clear();
-            }
-        }
+        observe_fasta_index_chunk(block.bytes(), &mut line, &mut builder)?;
     }
     if !line.is_empty() {
         builder.observe_physical_line(&line)?;
@@ -1653,15 +1680,42 @@ fn build_fasta_index_bufread<R: BufRead>(
 ) -> Result<()> {
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
             break;
         }
+        let consumed = observe_fasta_index_chunk(available, &mut line, builder)?;
+        reader.consume(consumed);
+    }
+    if !line.is_empty() {
         builder.observe_physical_line(&line)?;
     }
     builder.finish_current()?;
     Ok(())
+}
+
+fn observe_fasta_index_chunk(
+    bytes: &[u8],
+    carry: &mut Vec<u8>,
+    builder: &mut FastaIndexBuilder,
+) -> Result<usize> {
+    let mut consumed = 0;
+    while consumed < bytes.len() {
+        let Some(relative_newline) = memchr(b'\n', &bytes[consumed..]) else {
+            carry.extend_from_slice(&bytes[consumed..]);
+            return Ok(bytes.len());
+        };
+        let line_end = consumed + relative_newline + 1;
+        if carry.is_empty() {
+            builder.observe_physical_line(&bytes[consumed..line_end])?;
+        } else {
+            carry.extend_from_slice(&bytes[consumed..line_end]);
+            builder.observe_physical_line(carry)?;
+            carry.clear();
+        }
+        consumed = line_end;
+    }
+    Ok(consumed)
 }
 
 impl FastaIndexBuilder {

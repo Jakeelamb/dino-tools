@@ -16,7 +16,6 @@ use std::fmt;
 use std::io::Read;
 
 use crate::fastq_frame::{self, Line, RecordLines, RecordValidation};
-use crate::scan::scan_newlines;
 use crate::{FastqConfig, FastqError, Result as FastqResult};
 
 /// Summary of a packed DNA sequence.
@@ -398,6 +397,7 @@ struct TrustedFastqPackReader<R> {
     reader: R,
     slab_size: usize,
     buf: Vec<u8>,
+    start: usize,
     len: usize,
     eof: bool,
     base_offset: u64,
@@ -413,6 +413,7 @@ impl<R: Read> TrustedFastqPackReader<R> {
             reader,
             slab_size,
             buf: vec![0_u8; slab_size],
+            start: 0,
             len: 0,
             eof: false,
             base_offset: 0,
@@ -423,10 +424,11 @@ impl<R: Read> TrustedFastqPackReader<R> {
     }
 
     fn next_slab(&mut self, sink: &mut impl TrustedPackSink) -> FastqResult<bool> {
-        if self.eof && self.len == 0 {
+        if self.eof && self.start == self.len {
             return Ok(false);
         }
 
+        self.compact_incomplete_tail()?;
         while !self.eof && self.len < self.slab_size {
             let n = self.reader.read(&mut self.buf[self.len..self.slab_size])?;
             if n == 0 {
@@ -442,7 +444,7 @@ impl<R: Read> TrustedFastqPackReader<R> {
             eof: self.eof,
         };
         let slab = pack_trusted_fastq_direct_slab(
-            &self.buf[..self.len],
+            &self.buf[self.start..self.len],
             context,
             &mut self.bases,
             &mut self.n_mask,
@@ -455,23 +457,24 @@ impl<R: Read> TrustedFastqPackReader<R> {
         }
         self.record_index += slab.records;
 
-        if slab.next_start == self.len {
-            self.base_offset += self.len as u64;
+        let next_start = self.start + slab.next_start;
+        if next_start == self.len {
+            self.base_offset += self.len.saturating_sub(self.start) as u64;
+            self.start = 0;
             self.len = 0;
         } else {
-            let carry = self.len - slab.next_start;
-            if slab.next_start == 0 && carry == self.slab_size && !self.eof {
+            let carry = self.len - next_start;
+            if next_start == self.start && carry == self.slab_size && !self.eof {
                 return Err(FastqError::RecordTooLarge {
                     slab_size: self.slab_size,
                 });
             }
-            self.buf.copy_within(slab.next_start..self.len, 0);
             self.base_offset += slab.next_start as u64;
-            self.len = carry;
+            self.start = next_start;
         }
 
         if self.eof {
-            if self.len == 0 {
+            if self.start == self.len {
                 return Ok(slab.records != 0);
             }
             return Err(FastqError::RecordTooLarge {
@@ -480,6 +483,33 @@ impl<R: Read> TrustedFastqPackReader<R> {
         }
 
         Ok(true)
+    }
+
+    fn compact_incomplete_tail(&mut self) -> FastqResult<()> {
+        if self.start == 0 {
+            if self.len == self.slab_size && !self.eof {
+                return Err(FastqError::RecordTooLarge {
+                    slab_size: self.slab_size,
+                });
+            }
+            return Ok(());
+        }
+        if self.start == self.len {
+            self.start = 0;
+            self.len = 0;
+            return Ok(());
+        }
+
+        let carry = self.len - self.start;
+        self.buf.copy_within(self.start..self.len, 0);
+        self.start = 0;
+        self.len = carry;
+        if self.len == self.slab_size && !self.eof {
+            return Err(FastqError::RecordTooLarge {
+                slab_size: self.slab_size,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -622,10 +652,9 @@ struct TrustedFastqLineReader<R> {
     eof: bool,
     base_offset: u64,
     record_index: u64,
-    newlines: Vec<usize>,
-    line_count: usize,
-    available_records: usize,
-    scanned: bool,
+    scan_cursor: usize,
+    records: Vec<RecordSpan>,
+    consumed_records: usize,
 }
 
 impl<R: Read> TrustedFastqLineReader<R> {
@@ -639,24 +668,22 @@ impl<R: Read> TrustedFastqLineReader<R> {
             eof: false,
             base_offset: 0,
             record_index: 0,
-            newlines: Vec::with_capacity(slab_size / 48),
-            line_count: 0,
-            available_records: 0,
-            scanned: false,
+            scan_cursor: 0,
+            records: Vec::with_capacity(slab_size / 96),
+            consumed_records: 0,
         }
     }
 
     fn available_records(&mut self) -> FastqResult<usize> {
-        if self.scanned {
-            return Ok(self.available_records);
+        if self.consumed_records < self.records.len() {
+            return Ok(self.records.len() - self.consumed_records);
         }
-        if self.eof && self.len == 0 {
-            self.available_records = 0;
-            self.line_count = 0;
-            self.scanned = true;
+        if self.eof && self.scan_cursor == self.len {
+            self.reset_consumed();
             return Ok(0);
         }
 
+        self.compact_consumed_or_tail()?;
         while !self.eof && self.len < self.slab_size {
             let n = self.reader.read(&mut self.buf[self.len..self.slab_size])?;
             if n == 0 {
@@ -666,73 +693,168 @@ impl<R: Read> TrustedFastqLineReader<R> {
             self.len += n;
         }
 
-        scan_newlines(&self.buf[..self.len], &mut self.newlines);
-        let has_final_line = self.eof
-            && self
-                .newlines
-                .last()
-                .map_or(self.len != 0, |&nl| nl + 1 < self.len);
-        self.line_count = self.newlines.len() + usize::from(has_final_line);
-        if self.eof && !self.line_count.is_multiple_of(4) {
-            let record_index = self.record_index + (self.line_count / 4) as u64;
-            return Err(fastq_frame::format_at(
-                "truncated FASTQ record",
-                self.base_offset,
-                fastq_frame::line_start(&self.newlines, (self.line_count / 4) * 4),
-                record_index,
-                (self.line_count % 4) as u8,
-            ));
-        }
-
-        let complete_lines = (self.line_count / 4) * 4;
-        self.available_records = complete_lines / 4;
-        self.scanned = true;
-        if self.available_records == 0 && self.len == self.slab_size && !self.eof {
+        self.scan_records()?;
+        let available_records = self.records.len() - self.consumed_records;
+        if available_records == 0 && self.len == self.slab_size && !self.eof {
             return Err(FastqError::RecordTooLarge {
                 slab_size: self.slab_size,
             });
         }
-        Ok(self.available_records)
+        Ok(available_records)
     }
 
     fn is_done(&self) -> bool {
-        self.eof && self.len == 0
+        self.eof && self.consumed_records == self.records.len() && self.scan_cursor == self.len
     }
 
     fn record_lines(&self, index: usize) -> RecordLines<'_> {
-        let line = index * 4;
-        fastq_frame::record_lines(&self.buf[..self.len], &self.newlines, line)
+        self.records[self.consumed_records + index].to_lines(&self.buf[..self.len])
     }
 
     fn consume_records(&mut self, records: usize) -> FastqResult<()> {
         if records == 0 {
             return Ok(());
         }
-        let consumed_lines = records * 4;
-        let next_start = if self.eof && consumed_lines == self.line_count {
-            self.len
-        } else {
-            fastq_frame::line_start(&self.newlines, consumed_lines)
-        };
-        if next_start == self.len {
-            self.base_offset += self.len as u64;
-            self.len = 0;
-        } else {
-            let carry = self.len - next_start;
-            if next_start == 0 && carry == self.slab_size && !self.eof {
-                return Err(FastqError::RecordTooLarge {
-                    slab_size: self.slab_size,
-                });
-            }
-            self.buf.copy_within(next_start..self.len, 0);
-            self.base_offset += next_start as u64;
-            self.len = carry;
+        self.consumed_records += records;
+        if self.consumed_records > self.records.len() {
+            return Err(FastqError::Format(
+                "internal trusted FASTQ record cursor advanced past available records".into(),
+            ));
         }
         self.record_index += records as u64;
-        self.scanned = false;
-        self.line_count = 0;
-        self.available_records = 0;
         Ok(())
+    }
+
+    fn scan_records(&mut self) -> FastqResult<()> {
+        let mut cursor = self.scan_cursor;
+        let scan_base = cursor;
+        let mut newlines = memchr::memchr_iter(b'\n', &self.buf[scan_base..self.len])
+            .map(|offset| scan_base + offset);
+        while cursor < self.len {
+            let record_start = cursor;
+            let Some(name) =
+                trusted_direct_line(&self.buf[..self.len], &mut cursor, &mut newlines, self.eof)
+            else {
+                self.scan_cursor = record_start;
+                return Ok(());
+            };
+            let Some(seq) =
+                trusted_direct_line(&self.buf[..self.len], &mut cursor, &mut newlines, self.eof)
+            else {
+                return self.incomplete_or_truncated(record_start, 1);
+            };
+            let Some(plus) =
+                trusted_direct_line(&self.buf[..self.len], &mut cursor, &mut newlines, self.eof)
+            else {
+                return self.incomplete_or_truncated(record_start, 2);
+            };
+            let Some(qual) =
+                trusted_direct_line(&self.buf[..self.len], &mut cursor, &mut newlines, self.eof)
+            else {
+                return self.incomplete_or_truncated(record_start, 3);
+            };
+
+            self.records.push(RecordSpan {
+                name: LineSpan::from_line(name),
+                seq: LineSpan::from_line(seq),
+                plus: LineSpan::from_line(plus),
+                qual: LineSpan::from_line(qual),
+            });
+            self.scan_cursor = cursor;
+        }
+        Ok(())
+    }
+
+    fn incomplete_or_truncated(&mut self, record_start: usize, line_index: u8) -> FastqResult<()> {
+        if self.eof {
+            let record_index =
+                self.record_index + (self.records.len() - self.consumed_records) as u64;
+            Err(fastq_frame::format_at(
+                "truncated FASTQ record",
+                self.base_offset,
+                self.len,
+                record_index,
+                line_index,
+            ))
+        } else {
+            self.scan_cursor = record_start;
+            Ok(())
+        }
+    }
+
+    fn compact_consumed_or_tail(&mut self) -> FastqResult<()> {
+        if self.consumed_records < self.records.len() {
+            return Ok(());
+        }
+
+        let retain_start = self.scan_cursor;
+        if retain_start == self.len {
+            self.base_offset += self.len as u64;
+            self.len = 0;
+            self.scan_cursor = 0;
+            self.reset_consumed();
+            return Ok(());
+        }
+        if retain_start > 0 {
+            let carry = self.len - retain_start;
+            self.buf.copy_within(retain_start..self.len, 0);
+            self.base_offset += retain_start as u64;
+            self.len = carry;
+            self.scan_cursor = 0;
+            self.reset_consumed();
+        }
+        if self.len == self.slab_size && !self.eof {
+            return Err(FastqError::RecordTooLarge {
+                slab_size: self.slab_size,
+            });
+        }
+        Ok(())
+    }
+
+    fn reset_consumed(&mut self) {
+        self.records.clear();
+        self.consumed_records = 0;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LineSpan {
+    start: usize,
+    end: usize,
+}
+
+impl LineSpan {
+    fn from_line(line: Line<'_>) -> Self {
+        Self {
+            start: line.start,
+            end: line.start + line.bytes.len(),
+        }
+    }
+
+    fn to_line<'a>(self, bytes: &'a [u8]) -> Line<'a> {
+        Line {
+            bytes: &bytes[self.start..self.end],
+            start: self.start,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RecordSpan {
+    name: LineSpan,
+    seq: LineSpan,
+    plus: LineSpan,
+    qual: LineSpan,
+}
+
+impl RecordSpan {
+    fn to_lines<'a>(self, bytes: &'a [u8]) -> RecordLines<'a> {
+        RecordLines {
+            name: self.name.to_line(bytes),
+            seq: self.seq.to_line(bytes),
+            plus: self.plus.to_line(bytes),
+            qual: self.qual.to_line(bytes),
+        }
     }
 }
 

@@ -51,8 +51,8 @@ while let Some(batch) = reader.next_batch()? {
 # Ok::<(), dino_seq::FastqError>(())
 ```
 
-For owned downstream buffers, see
-[`examples/fastq_chunk_sink.rs`](examples/fastq_chunk_sink.rs).
+Use `FastqReader::next_chunk_with_sink` when downstream code wants to fill
+owned buffers without building a batch side table.
 
 ## FASTA Entry Points
 
@@ -90,7 +90,6 @@ assert_eq!(record.seq(), b"ACGT");
 - `libdeflate`: optional libdeflate BGZF backends and explicit gzip openers
 - `mmap`: resident file visitors and counters backed by read-only memory maps
 - `simd`: stable `std::arch` acceleration where supported
-- `asm-scan`: x86-64 newline scanner experiment
 
 ## CLI
 

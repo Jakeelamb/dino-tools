@@ -1,7 +1,11 @@
 use dino_seq::pack::{pack_bases_and_summarize_qualities_into, pack_trusted_fastq};
-use dino_seq::{FastqConfig, FastqReader, FastqVisitRecord};
+use dino_seq::{
+    FastaIndex, FastaReader, FastqConfig, FastqReader, FastqVisitRecord, IndexedFastaReader,
+    build_fasta_index, count_fasta_bytes,
+};
 use std::env;
 use std::hint::black_box;
+use std::io::Cursor;
 use std::time::Instant;
 
 const RECORDS: usize = 50_000;
@@ -52,6 +56,10 @@ enum Case {
     ParseNoValidate,
     Pack,
     TrustedPack,
+    FastaCountResident,
+    FastaVisitStream,
+    FastaIndexBuild,
+    FastaFetchIndexed,
     #[cfg(feature = "bgzf")]
     BgzfDecodeParse,
 }
@@ -66,6 +74,10 @@ impl Case {
             Self::ParseNoValidate => "parse_raw_no_validate_8m_slab",
             Self::Pack => "parse_and_pack_seq_qual",
             Self::TrustedPack => "trusted_default_pack_seq_qual",
+            Self::FastaCountResident => "fasta_count_resident_wrapped",
+            Self::FastaVisitStream => "fasta_visit_stream_wrapped",
+            Self::FastaIndexBuild => "fasta_index_build_wrapped",
+            Self::FastaFetchIndexed => "fasta_fetch_indexed_wrapped",
             #[cfg(feature = "bgzf")]
             Self::BgzfDecodeParse => "bgzf_parallel_decode_then_parse",
         }
@@ -82,6 +94,10 @@ impl Case {
             "trusted-pack" | "trusted_default_pack_seq_qual" | "trusted_direct_pack_seq_qual" => {
                 Some(Self::TrustedPack)
             }
+            "fasta-count" | "fasta_count_resident_wrapped" => Some(Self::FastaCountResident),
+            "fasta-visit" | "fasta_visit_stream_wrapped" => Some(Self::FastaVisitStream),
+            "fasta-index" | "fasta_index_build_wrapped" => Some(Self::FastaIndexBuild),
+            "fasta-fetch" | "fasta_fetch_indexed_wrapped" => Some(Self::FastaFetchIndexed),
             #[cfg(feature = "bgzf")]
             "bgzf" | "bgzf_parallel_decode_then_parse" => Some(Self::BgzfDecodeParse),
             _ => None,
@@ -164,6 +180,10 @@ fn print_cases() {
     println!("parse-no-validate");
     println!("pack");
     println!("trusted-pack");
+    println!("fasta-count");
+    println!("fasta-visit");
+    println!("fasta-index");
+    println!("fasta-fetch");
     #[cfg(feature = "bgzf")]
     println!("bgzf");
 }
@@ -182,6 +202,40 @@ fn synthetic_fastq(records: usize, read_len: usize) -> Vec<u8> {
         out.extend_from_slice(b"\n");
     }
     out
+}
+
+fn synthetic_fasta(records: usize, read_len: usize, wrap: usize) -> Vec<u8> {
+    let wrap = wrap.max(1);
+    let mut out = Vec::with_capacity(records * (read_len + read_len / wrap + 32));
+    for i in 0..records {
+        out.extend_from_slice(b">seq");
+        out.extend_from_slice(i.to_string().as_bytes());
+        out.extend_from_slice(b"\n");
+        write_wrapped_sequence(&mut out, i, read_len, wrap);
+    }
+    out
+}
+
+fn synthetic_reference_fasta(name: &[u8], bases: usize, wrap: usize) -> Vec<u8> {
+    let wrap = wrap.max(1);
+    let mut out = Vec::with_capacity(bases + bases / wrap + name.len() + 8);
+    out.extend_from_slice(b">");
+    out.extend_from_slice(name);
+    out.extend_from_slice(b"\n");
+    write_wrapped_sequence(&mut out, 0, bases, wrap);
+    out
+}
+
+fn write_wrapped_sequence(out: &mut Vec<u8>, seed: usize, len: usize, wrap: usize) {
+    let mut written = 0;
+    while written < len {
+        let take = (len - written).min(wrap);
+        for j in 0..take {
+            out.push(b"ACGT"[(seed + written + j) & 3]);
+        }
+        out.push(b'\n');
+        written += take;
+    }
 }
 
 fn run_case<F>(name: &str, bytes: u64, iters: usize, mut f: F) -> BenchResult<()>
@@ -295,6 +349,39 @@ fn trusted_default_pack_seq_qual(input: &[u8]) -> BenchResult<u64> {
     Ok(checksum)
 }
 
+fn fasta_count_resident_wrapped(input: &[u8]) -> BenchResult<u64> {
+    Ok(count_fasta_bytes(input)?.checksum)
+}
+
+fn fasta_visit_stream_wrapped(input: &[u8]) -> BenchResult<u64> {
+    let mut reader = FastaReader::new(input);
+    let mut checksum = 0_u64;
+    reader.visit_records(|record| {
+        checksum = checksum
+            .wrapping_add(record.name().len() as u64)
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(record.seq().len() as u64);
+        Ok(())
+    })?;
+    Ok(checksum)
+}
+
+fn fasta_index_build_wrapped(input: &[u8]) -> BenchResult<u64> {
+    let index = build_fasta_index(input)?;
+    Ok(index
+        .entries()
+        .iter()
+        .fold(index.len() as u64, |acc, entry| acc.wrapping_add(entry.len)))
+}
+
+fn fasta_fetch_indexed_wrapped(input: &[u8], index: &FastaIndex, bases: usize) -> BenchResult<u64> {
+    let mut reader = IndexedFastaReader::new(Cursor::new(input), index.clone());
+    let fetched = reader.fetch(b"chr1", 0..bases as u64)?;
+    Ok(fetched.first().copied().unwrap_or_default() as u64
+        + fetched.last().copied().unwrap_or_default() as u64
+        + fetched.len() as u64)
+}
+
 #[cfg(feature = "bgzf")]
 fn bgzf_parallel_decode_then_parse(encoded: &[u8]) -> BenchResult<u64> {
     let decoded = dino_seq::decompress_bgzf_parallel(encoded, 4)?;
@@ -306,6 +393,10 @@ fn main() -> BenchResult<()> {
     let config = BenchConfig::from_env_and_args()?;
     let input = synthetic_fastq(config.records, config.read_len);
     let bytes = input.len() as u64;
+    let fasta_input = synthetic_fasta(config.records, config.read_len, 80);
+    let fasta_bytes = fasta_input.len() as u64;
+    let fetch_bases = config.records.saturating_mul(config.read_len);
+    let fasta_reference = synthetic_reference_fasta(b"chr1", fetch_bases, 80);
     if Case::ParseStrict.should_run(config.case) {
         run_case(Case::ParseStrict.name(), bytes, config.iters, || {
             parse_raw_strict_8m_slab(&input)
@@ -335,6 +426,39 @@ fn main() -> BenchResult<()> {
         run_case(Case::TrustedPack.name(), bytes, config.iters, || {
             trusted_default_pack_seq_qual(&input)
         })?;
+    }
+    if Case::FastaCountResident.should_run(config.case) {
+        run_case(
+            Case::FastaCountResident.name(),
+            fasta_bytes,
+            config.iters,
+            || fasta_count_resident_wrapped(&fasta_input),
+        )?;
+    }
+    if Case::FastaVisitStream.should_run(config.case) {
+        run_case(
+            Case::FastaVisitStream.name(),
+            fasta_bytes,
+            config.iters,
+            || fasta_visit_stream_wrapped(&fasta_input),
+        )?;
+    }
+    if Case::FastaIndexBuild.should_run(config.case) {
+        run_case(
+            Case::FastaIndexBuild.name(),
+            fasta_bytes,
+            config.iters,
+            || fasta_index_build_wrapped(&fasta_input),
+        )?;
+    }
+    if Case::FastaFetchIndexed.should_run(config.case) {
+        let fasta_reference_index = build_fasta_index(fasta_reference.as_slice())?;
+        run_case(
+            Case::FastaFetchIndexed.name(),
+            fetch_bases as u64,
+            config.iters,
+            || fasta_fetch_indexed_wrapped(&fasta_reference, &fasta_reference_index, fetch_bases),
+        )?;
     }
 
     #[cfg(feature = "bgzf")]

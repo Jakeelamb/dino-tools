@@ -50,12 +50,7 @@
 //! - `transport` enables both `gzip` and `bgzf` for callers that want the old
 //!   all-transport convenience build.
 //! - `pure-rust-compression` is a compatibility alias for `transport`.
-//! - `simd` enables stable `std::arch` scanner and packing paths where
-//!   supported.
-//! - `asm-scan` (x86-64 only) uses a hand-written AVX2 newline scanner instead of
-//!   LLVM-generated intrinsics for the internal newline scan, for experiments.
-//!   When both `simd` and `asm-scan` are enabled on x86-64, `asm-scan` takes
-//!   precedence for newline scanning only.
+//! - `simd` enables stable `std::arch` packing paths where supported.
 //!
 //! # Example
 //!
@@ -109,7 +104,6 @@ mod mmap;
 /// packed two-bit bases, ambiguity masks, and Phred+33 summaries without
 /// allocating an owned record per read.
 pub mod pack;
-mod scan;
 mod source;
 
 #[cfg(feature = "bgzf")]

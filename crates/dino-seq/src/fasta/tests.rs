@@ -84,7 +84,7 @@ fn rejects_empty_header() {
 
 #[test]
 fn visits_records() {
-    let input = b">seq1\nAC\n>seq2\nGT\n";
+    let input = b">seq1\nAC\nGT\n>seq2\nTA\n";
     let mut reader = FastaReader::new(&input[..]);
     let mut seen = Vec::new();
     reader
@@ -97,8 +97,8 @@ fn visits_records() {
     assert_eq!(
         seen,
         vec![
-            (b"seq1".to_vec(), b"AC".to_vec()),
-            (b"seq2".to_vec(), b"GT".to_vec())
+            (b"seq1".to_vec(), b"ACGT".to_vec()),
+            (b"seq2".to_vec(), b"TA".to_vec())
         ]
     );
 }
@@ -273,6 +273,20 @@ fn builds_fasta_index_for_wrapped_reference() {
     assert_eq!(
         index.to_fai_string(),
         "chr1\t6\t18\t4\t5\nchr2\t4\t32\t4\t5\n"
+    );
+}
+
+#[test]
+fn fasta_index_bufread_handles_split_and_unterminated_lines() {
+    let input = b">chr1 description\nACGT\nAC\n>chr2\nTTTT";
+    let mut reader = BufReader::with_capacity(3, &input[..]);
+    let mut builder = FastaIndexBuilder::default();
+    build_fasta_index_bufread(&mut reader, &mut builder).unwrap();
+    let index = builder.finish();
+
+    assert_eq!(
+        index.to_fai_string(),
+        "chr1\t6\t18\t4\t5\nchr2\t4\t32\t4\t4\n"
     );
 }
 

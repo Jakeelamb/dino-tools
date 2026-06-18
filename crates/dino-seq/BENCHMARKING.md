@@ -18,6 +18,10 @@ The benchmark file covers:
 - validated FASTQ visitor parsing without batch side tables
 - parse-plus-pack side-channel work
 - trusted direct parse-plus-pack side-channel work without batch side tables
+- resident wrapped FASTA counting
+- streaming wrapped FASTA visiting without batch side tables
+- wrapped FASTA index building
+- indexed wrapped FASTA fetch
 - BGZF decode-then-parse when the `bgzf` feature is enabled
 
 Run one case when collecting perf counters or flamegraphs:
@@ -25,6 +29,7 @@ Run one case when collecting perf counters or flamegraphs:
 ```bash
 cargo bench --bench throughput --all-features -- --list
 cargo bench --bench throughput --all-features -- --case pack --records 500000 --iters 20
+cargo bench --bench throughput --all-features -- --case fasta-count --records 500000 --read-len 150 --iters 20
 bench_bin=$(find ../../target/release/deps -maxdepth 1 -type f -executable -name 'throughput-*' | head -n1)
 perf stat -d "$bench_bin" --case pack --records 500000 --iters 20
 ```

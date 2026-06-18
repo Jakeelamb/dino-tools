@@ -16,7 +16,10 @@ include = [
     "/README.md",
     "/LICENSE-APACHE",
     "/LICENSE-MIT",
+    "/benches/throughput.rs",
+    "/examples/fastq_chunk_sink.rs",
     "/src/**",
+    "/tests/cli.rs",
 ]
 
 [lib]
@@ -42,7 +45,6 @@ mmap = ["dep:memmap2"]
 transport = ["bgzf", "gzip"]
 pure-rust-compression = ["transport"]
 simd = []
-asm-scan = []
 
 [lints.rust]
 unsafe_code = "allow"

@@ -6,6 +6,16 @@ lab_root="${DINO_QUANT_LAB_ROOT:-"$(dirname "$repo_root")/dino-quant-lab"}"
 bench_threads="${BENCH_THREADS:-8}"
 time_bin="${TIME_BIN:-/usr/bin/time}"
 
+assisted_top_k=20
+assisted_window=64
+assisted_stride=16
+assisted_dim=128
+assisted_candidate_limit=64
+assisted_minimizer_k=15
+assisted_minimizer_window=8
+assisted_padding=64
+assisted_merge_gap=32
+
 usage() {
   cat <<USAGE
 usage:
@@ -19,6 +29,8 @@ usage:
   scripts/quant-lab run-suite smoke|ready|all
   scripts/quant-lab score-minimap2-candidates CANDIDATES_TSV MINIMAP2_PAF
   scripts/quant-lab score-translated-paf BASELINE_PAF ASSISTED_PAF
+  scripts/quant-lab gate-minimap2-candidates PARITY_TSV
+  scripts/quant-lab gate-translated-paf PARITY_TSV
   scripts/quant-lab optimize-retrieval minimizer|simhash|mih|ivf|hnsw
   scripts/quant-lab summarize
   scripts/quant-lab new-run TOOL APP [VARIANT]
@@ -272,6 +284,69 @@ run_timed() {
   fi
 }
 
+file_sha256() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    sha256sum "$path" | awk '{ print $1 }'
+  else
+    printf 'NA\n'
+  fi
+}
+
+file_bytes() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    stat -c %s "$path"
+  else
+    printf 'NA\n'
+  fi
+}
+
+repo_dirty_flag() {
+  if [ -n "$(git -C "$repo_root" status --short)" ]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+tool_version() {
+  local tool="$1"
+  if [ -x "$tool" ]; then
+    "$tool" --version 2>&1 | head -n 1
+  else
+    printf 'NA\n'
+  fi
+}
+
+write_provenance() {
+  local output="${1:?missing OUTPUT}"
+  shift || true
+  {
+    printf 'repo_commit\t%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
+    printf 'repo_dirty\t%s\n' "$(repo_dirty_flag)"
+    printf 'cargo_lock_sha256\t%s\n' "$(file_sha256 "$repo_root/Cargo.lock")"
+    printf 'dino_quant_release_sha256\t%s\n' "$(file_sha256 "$repo_root/target/release/dino-quant")"
+    printf 'minimap2_version\t%s\n' "$(tool_version "$lab_root/tools/minimap2/minimap2")"
+    printf 'bowtie2_version\t%s\n' "$(tool_version "$lab_root/tools/bowtie2/bowtie2")"
+    printf 'bench_threads\t%s\n' "$bench_threads"
+    if [ "$#" -gt 0 ]; then
+      printf 'command\t%s\n' "$*"
+    fi
+  } > "$output"
+}
+
+write_file_provenance() {
+  local output="${1:?missing OUTPUT}"
+  local label="${2:?missing LABEL}"
+  local path="${3:?missing PATH}"
+  {
+    printf '%s_path\t%s\n' "$label" "$path"
+    printf '%s_bytes\t%s\n' "$label" "$(file_bytes "$path")"
+    printf '%s_sha256\t%s\n' "$label" "$(file_sha256 "$path")"
+  } >> "$output"
+}
+
 score_minimap2_candidates() {
   local candidates_tsv="${1:?missing CANDIDATES_TSV}"
   local minimap2_paf="${2:?missing MINIMAP2_PAF}"
@@ -419,6 +494,60 @@ score_translated_paf() {
   ' "$baseline_paf" "$assisted_paf"
 }
 
+metric_value() {
+  local metrics_tsv="${1:?missing METRICS_TSV}"
+  local metric="${2:?missing METRIC}"
+  awk -F '\t' -v metric="$metric" '
+    $1 == metric {
+      print $2
+      found = 1
+      exit
+    }
+    END {
+      if (!found) exit 1
+    }
+  ' "$metrics_tsv"
+}
+
+assert_metric_at_least() {
+  local metrics_tsv="${1:?missing METRICS_TSV}"
+  local metric="${2:?missing METRIC}"
+  local minimum="${3:?missing MINIMUM}"
+  local gate_tsv="${4:?missing GATE_TSV}"
+  local value
+  value="$(metric_value "$metrics_tsv" "$metric")" || {
+    printf 'missing_metric\t%s\t%s\n' "$metrics_tsv" "$metric" >&2
+    return 1
+  }
+  awk -v value="$value" -v minimum="$minimum" 'BEGIN {
+    if (value == "NA") exit 1
+    if ((value + 0) + 1e-12 < (minimum + 0)) exit 1
+  }' || {
+    printf 'gate_failed\t%s\t%s\tminimum=%s\tactual=%s\n' "$metrics_tsv" "$metric" "$minimum" "$value" >&2
+    printf '%s\t%s\t%s\tfail\n' "$metric" "$minimum" "$value" >> "$gate_tsv"
+    return 1
+  }
+  printf '%s\t%s\t%s\tpass\n' "$metric" "$minimum" "$value" >> "$gate_tsv"
+}
+
+gate_minimap2_candidates() {
+  local metrics_tsv="${1:?missing PARITY_TSV}"
+  local gate_tsv="${metrics_tsv%.tsv}.gate.tsv"
+  local min_top20="${DINO_QUANT_MIN_TOP20_RECALL:-1.0}"
+  printf 'metric\tminimum\tactual\tstatus\n' > "$gate_tsv"
+  assert_metric_at_least "$metrics_tsv" top20_recall "$min_top20" "$gate_tsv"
+}
+
+gate_translated_paf() {
+  local metrics_tsv="${1:?missing PARITY_TSV}"
+  local gate_tsv="${metrics_tsv%.tsv}.gate.tsv"
+  local min_recall="${DINO_QUANT_MIN_MAPPED_QUERY_RECALL:-1.0}"
+  local min_parity="${DINO_QUANT_MIN_COORDINATE_PARITY:-1.0}"
+  printf 'metric\tminimum\tactual\tstatus\n' > "$gate_tsv"
+  assert_metric_at_least "$metrics_tsv" mapped_query_recall "$min_recall" "$gate_tsv"
+  assert_metric_at_least "$metrics_tsv" coordinate_parity "$min_parity" "$gate_tsv"
+}
+
 retrieval_config_lines() {
   local mode="$1"
   case "$mode" in
@@ -527,11 +656,15 @@ RUN
 }
 
 assisted_minimap2_cache_dir() {
-  printf '%s/data/assisted/minimap2-ecoli-r1-10k-minimizer-k15-mw8-limit64-w64-s16-d128-top20-pad64-gap32-masked-v2\n' "$lab_root"
+  printf '%s/data/assisted/minimap2-ecoli-r1-10k-minimizer-k%s-mw%s-limit%s-w%s-s%s-d%s-top%s-pad%s-gap%s-masked-v2\n' \
+    "$lab_root" "$assisted_minimizer_k" "$assisted_minimizer_window" "$assisted_candidate_limit" \
+    "$assisted_window" "$assisted_stride" "$assisted_dim" "$assisted_top_k" "$assisted_padding" "$assisted_merge_gap"
 }
 
 assisted_minimap2_bundle_cache_dir() {
-  printf '%s/data/assisted/minimap2-bundle-r1-10k-minimizer-k15-mw8-limit64-w64-s16-d128-top20-pad64-gap32-masked-v1\n' "$lab_root"
+  printf '%s/data/assisted/minimap2-bundle-r1-10k-minimizer-k%s-mw%s-limit%s-w%s-s%s-d%s-top%s-pad%s-gap%s-masked-v1\n' \
+    "$lab_root" "$assisted_minimizer_k" "$assisted_minimizer_window" "$assisted_candidate_limit" \
+    "$assisted_window" "$assisted_stride" "$assisted_dim" "$assisted_top_k" "$assisted_padding" "$assisted_merge_gap"
 }
 
 assisted_minimap2_bundle_config_cache_dir() {
@@ -576,8 +709,10 @@ prepare_assisted_minimap2() {
 
   if [ ! -s "$cache_dir/candidates.tsv" ]; then
     cargo run -p dino-quant --release -- emit-candidates "$ref" "$reads" \
-      --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
-      --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+      --retrieval minimizer --top-k "$assisted_top_k" --window "$assisted_window" \
+      --stride "$assisted_stride" --dim "$assisted_dim" \
+      --candidate-limit "$assisted_candidate_limit" --minimizer-k "$assisted_minimizer_k" \
+      --minimizer-window "$assisted_minimizer_window" \
       --reference-cache "$cache_dir/reference-index.dqmi" --max-reads 10000 \
       > "$cache_dir/candidates.tsv.tmp" 2> "$cache_dir/candidates.stderr.txt"
     mv "$cache_dir/candidates.tsv.tmp" "$cache_dir/candidates.tsv"
@@ -585,7 +720,7 @@ prepare_assisted_minimap2() {
 
   if [ ! -s "$cache_dir/candidate-reference.fna" ]; then
     cargo run -p dino-quant --release -- emit-candidate-reference "$ref" "$cache_dir/candidates.tsv" \
-      --padding 64 --merge-gap 32 --mask-reference \
+      --padding "$assisted_padding" --merge-gap "$assisted_merge_gap" --mask-reference \
       > "$cache_dir/candidate-reference.fna.tmp" 2> "$cache_dir/candidate-reference.stderr.txt"
     mv "$cache_dir/candidate-reference.fna.tmp" "$cache_dir/candidate-reference.fna"
   fi
@@ -608,12 +743,22 @@ prepare_assisted_minimap2() {
     printf 'cache_dir\t%s\n' "$cache_dir"
     printf 'reference\t%s\n' "$ref"
     printf 'reads\t%s\n' "$reads"
+    printf 'top_k\t%s\n' "$assisted_top_k"
+    printf 'candidate_limit\t%s\n' "$assisted_candidate_limit"
+    printf 'padding\t%s\n' "$assisted_padding"
+    printf 'merge_gap\t%s\n' "$assisted_merge_gap"
     printf 'candidate_rows\t%s\n' "$(( $(wc -l < "$cache_dir/candidates.tsv") - 1 ))"
     printf 'candidate_reference_records\t%s\n' "$(awk '/^>/ { records += 1 } END { print records + 0 }' "$cache_dir/candidate-reference.fna")"
     printf 'candidate_reference_bases\t%s\n' "$(awk '!/^>/ { bases += length($0) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
     printf 'candidate_reference_unmasked_bases\t%s\n' "$(awk '!/^>/ { line=$0; gsub(/N/, "", line); bases += length(line) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
     printf 'candidate_reference_masked_bases\t%s\n' "$(awk '!/^>/ { total += length($0); line=$0; gsub(/N/, "", line); kept += length(line) } END { print total - kept }' "$cache_dir/candidate-reference.fna")"
   } > "$cache_dir/manifest.tsv"
+  write_provenance "$cache_dir/provenance.tsv" prepare-assisted-minimap2
+  write_file_provenance "$cache_dir/provenance.tsv" reference "$ref"
+  write_file_provenance "$cache_dir/provenance.tsv" reads "$reads"
+  write_file_provenance "$cache_dir/provenance.tsv" candidates "$cache_dir/candidates.tsv"
+  write_file_provenance "$cache_dir/provenance.tsv" candidate_reference "$cache_dir/candidate-reference.fna"
+  write_file_provenance "$cache_dir/provenance.tsv" candidate_reference_mmi "$cache_dir/candidate-reference.mmi"
   cat "$cache_dir/manifest.tsv"
 }
 
@@ -635,8 +780,10 @@ prepare_assisted_minimap2_bundle() {
 
   if [ ! -s "$cache_dir/candidates.tsv" ]; then
     cargo run -p dino-quant --release -- emit-candidates "$ref" "$reads" \
-      --retrieval minimizer --top-k 20 --window 64 --stride 16 --dim 128 \
-      --candidate-limit 64 --minimizer-k 15 --minimizer-window 8 \
+      --retrieval minimizer --top-k "$assisted_top_k" --window "$assisted_window" \
+      --stride "$assisted_stride" --dim "$assisted_dim" \
+      --candidate-limit "$assisted_candidate_limit" --minimizer-k "$assisted_minimizer_k" \
+      --minimizer-window "$assisted_minimizer_window" \
       --reference-cache "$cache_dir/reference-index.dqmi" --max-reads 10000 \
       > "$cache_dir/candidates.tsv.tmp" 2> "$cache_dir/candidates.stderr.txt"
     mv "$cache_dir/candidates.tsv.tmp" "$cache_dir/candidates.tsv"
@@ -644,7 +791,7 @@ prepare_assisted_minimap2_bundle() {
 
   if [ ! -s "$cache_dir/candidate-reference.fna" ]; then
     cargo run -p dino-quant --release -- emit-candidate-reference "$ref" "$cache_dir/candidates.tsv" \
-      --padding 64 --merge-gap 32 --mask-reference \
+      --padding "$assisted_padding" --merge-gap "$assisted_merge_gap" --mask-reference \
       > "$cache_dir/candidate-reference.fna.tmp" 2> "$cache_dir/candidate-reference.stderr.txt"
     mv "$cache_dir/candidate-reference.fna.tmp" "$cache_dir/candidate-reference.fna"
   fi
@@ -667,6 +814,10 @@ prepare_assisted_minimap2_bundle() {
     printf 'cache_dir\t%s\n' "$cache_dir"
     printf 'reference\t%s\n' "$ref"
     printf 'reads\t%s\n' "$reads"
+    printf 'top_k\t%s\n' "$assisted_top_k"
+    printf 'candidate_limit\t%s\n' "$assisted_candidate_limit"
+    printf 'padding\t%s\n' "$assisted_padding"
+    printf 'merge_gap\t%s\n' "$assisted_merge_gap"
     printf 'candidate_rows\t%s\n' "$(( $(wc -l < "$cache_dir/candidates.tsv") - 1 ))"
     printf 'candidate_reference_records\t%s\n' "$(awk '/^>/ { records += 1 } END { print records + 0 }' "$cache_dir/candidate-reference.fna")"
     printf 'candidate_reference_bases\t%s\n' "$(awk '!/^>/ { bases += length($0) } END { print bases + 0 }' "$cache_dir/candidate-reference.fna")"
@@ -674,6 +825,13 @@ prepare_assisted_minimap2_bundle() {
     printf 'candidate_reference_masked_bases\t%s\n' "$(awk '!/^>/ { total += length($0); line=$0; gsub(/N/, "", line); kept += length(line) } END { print total - kept }' "$cache_dir/candidate-reference.fna")"
     [ -s "$cache_dir/reference-index.dqmi" ] && printf 'reference_cache_bytes\t%s\n' "$(stat -c %s "$cache_dir/reference-index.dqmi")"
   } > "$cache_dir/manifest.tsv"
+  write_provenance "$cache_dir/provenance.tsv" prepare-assisted-minimap2-bundle
+  write_file_provenance "$cache_dir/provenance.tsv" reference "$ref"
+  write_file_provenance "$cache_dir/provenance.tsv" reads "$reads"
+  write_file_provenance "$cache_dir/provenance.tsv" candidates "$cache_dir/candidates.tsv"
+  write_file_provenance "$cache_dir/provenance.tsv" candidate_reference "$cache_dir/candidate-reference.fna"
+  write_file_provenance "$cache_dir/provenance.tsv" candidate_reference_mmi "$cache_dir/candidate-reference.mmi"
+  write_file_provenance "$cache_dir/provenance.tsv" reference_cache "$cache_dir/reference-index.dqmi"
   cat "$cache_dir/manifest.tsv"
 }
 
@@ -737,6 +895,13 @@ prepare_assisted_minimap2_bundle_config() {
     printf 'candidate_reference_mmi_bytes\t%s\n' "$(stat -c %s "$cache_dir/candidate-reference.mmi")"
     [ -s "$cache_dir/reference-index.dqmi" ] && printf 'reference_cache_bytes\t%s\n' "$(stat -c %s "$cache_dir/reference-index.dqmi")"
   } > "$cache_dir/manifest.tsv"
+  write_provenance "$cache_dir/provenance.tsv" prepare-assisted-minimap2-bundle-config "$top_k" "$candidate_limit" "$padding" "$merge_gap"
+  write_file_provenance "$cache_dir/provenance.tsv" reference "$ref"
+  write_file_provenance "$cache_dir/provenance.tsv" reads "$reads"
+  write_file_provenance "$cache_dir/provenance.tsv" candidates "$cache_dir/candidates.tsv"
+  write_file_provenance "$cache_dir/provenance.tsv" candidate_reference "$cache_dir/candidate-reference.fna"
+  write_file_provenance "$cache_dir/provenance.tsv" candidate_reference_mmi "$cache_dir/candidate-reference.mmi"
+  write_file_provenance "$cache_dir/provenance.tsv" reference_cache "$cache_dir/reference-index.dqmi"
   cat "$cache_dir/manifest.tsv"
 }
 
@@ -886,6 +1051,7 @@ run_matrix() {
     printf 'variant\t%s\n' "$variant"
     printf 'threads\t%s\n' "$bench_threads"
   } > "$run_dir/metadata.tsv"
+  write_provenance "$run_dir/provenance.tsv" "scripts/quant-lab run $matrix_id"
 
   case "$matrix_id" in
     smoke_minimap2)
@@ -949,6 +1115,7 @@ while read -r window stride top_k dim; do
     > "\$candidates" 2> "\$log"
   end_ns=\$(date +%s%N)
   scripts/quant-lab score-minimap2-candidates "\$candidates" "$run_dir/minimap2.paf" > "\$parity"
+  scripts/quant-lab gate-minimap2-candidates "\$parity"
   rows=\$((\$(wc -l < "\$candidates") - 1))
   mapped=\$(awk -F '\t' '\$1 == "scored_mapped_queries" { print \$2 }' "\$parity")
   top1=\$(awk -F '\t' '\$1 == "top1_recall" { print \$2 }' "\$parity")
@@ -986,6 +1153,7 @@ cargo run -p dino-quant --release -- emit-candidates \
   > "$run_dir/minimap2.paf"
 scripts/quant-lab score-minimap2-candidates \
   "$run_dir/candidates.tsv" "$run_dir/minimap2.paf" > "$run_dir/parity.tsv"
+scripts/quant-lab gate-minimap2-candidates "$run_dir/parity.tsv"
 cat "$run_dir/parity.tsv"
 RUN
       chmod +x "$run_dir/run.sh"
@@ -1014,6 +1182,7 @@ for mode in minimizer simhash mih ivf hnsw; do
     > "\$candidates" 2> "\$log"
   end_ns=\$(date +%s%N)
   scripts/quant-lab score-minimap2-candidates "\$candidates" "$run_dir/minimap2.paf" > "\$parity"
+  scripts/quant-lab gate-minimap2-candidates "\$parity"
   rows=\$((\$(wc -l < "\$candidates") - 1))
   mapped=\$(awk -F '\t' '\$1 == "scored_mapped_queries" { print \$2 }' "\$parity")
   top1=\$(awk -F '\t' '\$1 == "top1_recall" { print \$2 }' "\$parity")
@@ -1053,6 +1222,7 @@ cargo run -p dino-quant --release -- emit-candidate-reference "\$ref" "$run_dir/
   > "$run_dir/assisted.paf"
 scripts/quant-lab score-translated-paf "$run_dir/baseline.paf" "$run_dir/assisted.paf" \
   > "$run_dir/parity.tsv"
+scripts/quant-lab gate-translated-paf "$run_dir/parity.tsv"
 {
   printf 'metric\tvalue\n'
   printf 'candidate_reference_bases\t%s\n' "\$(awk '!/^>/ { bases += length(\$0) } END { print bases + 0 }' "$run_dir/candidate-reference.fna")"
@@ -1074,6 +1244,7 @@ RUN
       mv "$run_dir/stdout.txt" "$run_dir/assisted.paf"
       scripts/quant-lab score-translated-paf "$cache_dir/baseline.paf" "$run_dir/assisted.paf" \
         > "$run_dir/parity.tsv"
+      gate_translated_paf "$run_dir/parity.tsv"
       {
         printf 'metric\tvalue\n'
         awk -F '\t' 'NR > 0 { print }' "$run_dir/cache-manifest.tsv"
@@ -1116,6 +1287,7 @@ for reads in 100 1000 3000 10000; do
 
   scripts/quant-lab score-translated-paf "$run_dir/baseline-\${reads}.paf" "$run_dir/assisted-\${reads}.paf" \
     > "$run_dir/parity-\${reads}.tsv"
+  scripts/quant-lab gate-translated-paf "$run_dir/parity-\${reads}.tsv"
   baseline_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/baseline-\${reads}.time.txt")
   assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-\${reads}.time.txt")
   baseline_alignments=\$(awk -F '\t' '\$1 == "baseline_alignments" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
@@ -1167,6 +1339,7 @@ for reads in 100 1000 3000 10000; do
 
   scripts/quant-lab score-translated-paf "$run_dir/baseline-\${reads}.paf" "$run_dir/assisted-\${reads}.paf" \
     > "$run_dir/parity-\${reads}.tsv"
+  scripts/quant-lab gate-translated-paf "$run_dir/parity-\${reads}.tsv"
   baseline_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/baseline-\${reads}.time.txt")
   assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$run_dir/assisted-\${reads}.time.txt")
   baseline_alignments=\$(awk -F '\t' '\$1 == "baseline_alignments" { print \$2 }' "$run_dir/parity-\${reads}.tsv")
@@ -1254,6 +1427,7 @@ assisted_rss=\$(awk -F ': ' 'index(\$0, "Maximum resident") { print \$NF }' "$ru
 printf 'assisted_warm_map\t%s\t%s\t%s\n' "\$assisted_ms" "\$assisted_rss" "\$(wc -l < "$run_dir/assisted.paf")" >> "$run_dir/cold-warm.tsv"
 
 scripts/quant-lab score-translated-paf "$run_dir/baseline.paf" "$run_dir/assisted.paf" > "$run_dir/parity.tsv"
+scripts/quant-lab gate-translated-paf "$run_dir/parity.tsv"
 {
   cat "$run_dir/cold-warm.tsv"
   awk 'NR > 1 { print }' "$run_dir/parity.tsv"
@@ -1436,6 +1610,14 @@ case "${1:-}" in
   score-translated-paf)
     shift
     score_translated_paf "$@"
+    ;;
+  gate-minimap2-candidates)
+    shift
+    gate_minimap2_candidates "$@"
+    ;;
+  gate-translated-paf)
+    shift
+    gate_translated_paf "$@"
     ;;
   optimize-retrieval)
     shift

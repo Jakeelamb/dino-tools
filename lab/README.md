@@ -25,8 +25,9 @@ Use `scripts/quant-lab prepare all` to build first-wave indexes and signatures.
 Use `scripts/quant-lab prepare-assisted-minimap2` to cache the current
 minimizer-gated masked reference, minimap2 index, and baseline PAF.
 Use `scripts/quant-lab run-suite ready` to run missing ready rows once.
-Use `scripts/quant-lab run quant_minimap2_assisted_cached_scale_ecoli` to
-compare cached full-reference and masked-assisted minimap2 across read counts.
+Use `scripts/quant-lab run quant_minimap2_assisted_cached_bundle_scale_ecoli`
+to compare cached full-reference and masked-assisted minimap2 across read
+counts.
 Use `scripts/quant-lab summarize` to print external run metrics.
 Use `scripts/quant-lab score-minimap2-candidates CANDIDATES_TSV MINIMAP2_PAF`
 to score candidate-window recall against minimap2 mappings.
@@ -41,4 +42,6 @@ First-wave read rows use deterministic 10k-read slices. Set
 Set `DINO_QUANT_OPT_SIZES="100 1000 3000"` to control optimization read counts.
 Set `DINO_QUANT_REBUILD_CACHE=1` to rebuild assisted-minimap2 cached artifacts.
 Parity rows compare dino-quant candidate windows against baseline mapper output;
-they are recall gates, not accelerated mapper implementations.
+they are recall gates, not accelerated mapper implementations. Passing rows
+write gate files next to their parity TSVs, and run/cache directories write
+provenance TSVs with repo, binary, tool, and input fingerprints.

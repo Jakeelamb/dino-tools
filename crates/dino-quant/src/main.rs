@@ -1,12 +1,22 @@
 use dino_quant::{
-    QjlResidualSnapshot, QuantizedVector, QuantizedVectorSnapshot, QuantizerConfig,
-    ReferenceIndexConfig, ReferenceWindowIndex, SearchHit, concatenate_records, cosine_similarity,
-    dna_kmer_sketch, dot, intervals_overlap, mutate_dna, protein_kmer_sketch, read_fasta_file,
-    read_protein_fasta_file, reconstruction_metrics, synthetic_dna, visit_fastq_slices_file_limit,
+    QuantizedVector, QuantizerConfig, ReferenceIndexConfig, ReferenceWindowIndex, SearchHit,
+    concatenate_records, cosine_similarity, dna_kmer_sketch, dot, intervals_overlap, mutate_dna,
+    protein_kmer_sketch, read_fasta_file, read_protein_fasta_file, reconstruction_metrics,
+    synthetic_dna, visit_fastq_slices_file_limit,
+};
+mod reference_cache;
+mod retrieval;
+use reference_cache::{
+    ReferenceFingerprint, load_minimizer_reference_cache, reference_fingerprint,
+    save_minimizer_reference_cache,
+};
+use retrieval::{
+    CandidateScratch, CandidateWindow, ExperimentalCandidateIndex, IndexedSearchHit,
+    IndexedSearchResult, RetrievalMode, RetrievalOptions,
 };
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -209,166 +219,6 @@ struct Interval {
     end: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetrievalMode {
-    Scan,
-    Minimizer,
-    Simhash,
-    Mih,
-    Ivf,
-    Hnsw,
-}
-
-impl RetrievalMode {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "scan" => Ok(Self::Scan),
-            "minimizer" => Ok(Self::Minimizer),
-            "simhash" => Ok(Self::Simhash),
-            "mih" => Ok(Self::Mih),
-            "ivf" => Ok(Self::Ivf),
-            "hnsw" => Ok(Self::Hnsw),
-            other => Err(format!(
-                "unknown retrieval mode: {other}; expected scan|minimizer|simhash|mih|ivf|hnsw"
-            )),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Scan => "scan",
-            Self::Minimizer => "minimizer",
-            Self::Simhash => "simhash",
-            Self::Mih => "mih",
-            Self::Ivf => "ivf",
-            Self::Hnsw => "hnsw",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RetrievalOptions {
-    mode: RetrievalMode,
-    candidate_limit: usize,
-    minimizer_k: usize,
-    minimizer_window: usize,
-    simhash_bands: usize,
-    centroids: usize,
-    probes: usize,
-}
-
-impl Default for RetrievalOptions {
-    fn default() -> Self {
-        Self {
-            mode: RetrievalMode::Scan,
-            candidate_limit: 2048,
-            minimizer_k: 15,
-            minimizer_window: 8,
-            simhash_bands: 8,
-            centroids: 32,
-            probes: 4,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct IndexedSearchResult {
-    hits: Vec<SearchHit>,
-    considered: usize,
-}
-
-#[derive(Clone, Debug)]
-struct CandidateScratch {
-    counts: Vec<u32>,
-    touched: Vec<usize>,
-    ranked: Vec<(usize, u32)>,
-    candidate_ids: Vec<usize>,
-    minimizer_hashes: Vec<u64>,
-    minimizers: Vec<u64>,
-    minimizer_deque: Vec<usize>,
-}
-
-impl CandidateScratch {
-    fn new(window_count: usize) -> Self {
-        Self {
-            counts: vec![0; window_count],
-            touched: Vec::new(),
-            ranked: Vec::new(),
-            candidate_ids: Vec::new(),
-            minimizer_hashes: Vec::new(),
-            minimizers: Vec::new(),
-            minimizer_deque: Vec::new(),
-        }
-    }
-
-    fn reset_counts(&mut self) {
-        for idx in self.touched.drain(..) {
-            if idx < self.counts.len() {
-                self.counts[idx] = 0;
-            }
-        }
-        self.ranked.clear();
-        self.candidate_ids.clear();
-    }
-
-    fn resize_counts(&mut self, window_count: usize) {
-        self.reset_counts();
-        self.counts.resize(window_count, 0);
-    }
-
-    fn bump(&mut self, idx: usize, weight: u32) -> Result<(), String> {
-        let Some(count) = self.counts.get_mut(idx) else {
-            return Err("candidate posting id out of bounds".to_owned());
-        };
-        if *count == 0 {
-            self.touched.push(idx);
-        }
-        *count = count.saturating_add(weight);
-        Ok(())
-    }
-
-    fn ranked_candidate_ids(&mut self, limit: usize) -> &[usize] {
-        self.ranked.clear();
-        self.ranked.reserve(self.touched.len());
-        for idx in self.touched.drain(..) {
-            let count = self.counts[idx];
-            self.counts[idx] = 0;
-            self.ranked.push((idx, count));
-        }
-        self.ranked
-            .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        self.candidate_ids.clear();
-        self.candidate_ids
-            .extend(self.ranked.iter().take(limit).map(|(idx, _)| *idx));
-        &self.candidate_ids
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CandidateWindow {
-    target_id: usize,
-    target_start: usize,
-    sketch: Vec<f32>,
-    quantized: QuantizedVector,
-    simhash64: u64,
-    simhash128: [u64; 2],
-}
-
-#[derive(Clone, Debug)]
-struct ExperimentalCandidateIndex {
-    config: ReferenceIndexConfig,
-    retrieval: RetrievalOptions,
-    target_names: Vec<String>,
-    target_offsets: Vec<usize>,
-    windows: Vec<CandidateWindow>,
-    minimizer_postings: HashMap<u64, Vec<usize>>,
-    simhash_band_postings: Vec<HashMap<u16, Vec<usize>>>,
-    mih_postings: Vec<HashMap<u16, Vec<usize>>>,
-    centroids: Vec<Vec<f32>>,
-    centroid_lists: Vec<Vec<usize>>,
-    centroid_graph: Vec<Vec<usize>>,
-}
-
 impl ExperimentalCandidateIndex {
     fn build_records(
         records: &[dino_quant::SequenceRecord],
@@ -382,6 +232,10 @@ impl ExperimentalCandidateIndex {
         }
 
         let mut windows = Vec::new();
+        let mut minimizer_postings = HashMap::new();
+        let mut minimizer_hashes = Vec::new();
+        let mut minimizers = Vec::new();
+        let mut minimizer_deque = Vec::new();
         let mut target_names = Vec::with_capacity(records.len());
         let mut target_offsets = Vec::with_capacity(records.len());
         let mut linear_offset = 0_usize;
@@ -395,18 +249,34 @@ impl ExperimentalCandidateIndex {
                     (0..=record.bases.len() - config.window_len).step_by(config.stride)
                 {
                     let target_end = target_start + config.window_len;
-                    let sketch = dna_kmer_sketch(
-                        &record.bases[target_start..target_end],
-                        config.k,
-                        config.dim,
-                    )?;
+                    let window_idx = windows.len();
+                    let window_seq = &record.bases[target_start..target_end];
+                    let sketch = dna_kmer_sketch(window_seq, config.k, config.dim)?;
                     let quantized = config.quantizer.encode(&sketch)?;
                     let simhash64 = simhash_code64(&sketch, 0x51d0_a11e_0000_0064);
                     let simhash128 = [simhash64, simhash_code64(&sketch, 0x51d0_a11e_0000_0128)];
+                    if retrieval.mode == RetrievalMode::Minimizer {
+                        minimizer_hashes_into(
+                            window_seq,
+                            retrieval.minimizer_k,
+                            retrieval.minimizer_window,
+                            &mut minimizer_hashes,
+                            &mut minimizers,
+                            &mut minimizer_deque,
+                        )?;
+                        for hash in &minimizers {
+                            minimizer_postings
+                                .entry(*hash)
+                                .or_insert_with(Vec::new)
+                                .push(window_idx);
+                        }
+                    }
+                    let keep_sketch =
+                        matches!(retrieval.mode, RetrievalMode::Ivf | RetrievalMode::Hnsw);
                     windows.push(CandidateWindow {
                         target_id: record_idx,
                         target_start,
-                        sketch,
+                        sketch: keep_sketch.then_some(sketch),
                         quantized,
                         simhash64,
                         simhash128,
@@ -429,7 +299,7 @@ impl ExperimentalCandidateIndex {
             target_names,
             target_offsets,
             windows,
-            minimizer_postings: HashMap::new(),
+            minimizer_postings,
             simhash_band_postings: Vec::new(),
             mih_postings: Vec::new(),
             centroids: Vec::new(),
@@ -443,7 +313,11 @@ impl ExperimentalCandidateIndex {
     fn build_auxiliary(&mut self, records: &[dino_quant::SequenceRecord]) -> Result<(), String> {
         match self.retrieval.mode {
             RetrievalMode::Scan => {}
-            RetrievalMode::Minimizer => self.build_minimizer_postings(records)?,
+            RetrievalMode::Minimizer => {
+                if self.minimizer_postings.is_empty() {
+                    self.build_minimizer_postings(records)?;
+                }
+            }
             RetrievalMode::Simhash => self.build_simhash_band_postings(),
             RetrievalMode::Mih => self.build_mih_postings(),
             RetrievalMode::Ivf => self.build_centroid_lists(),
@@ -523,12 +397,16 @@ impl ExperimentalCandidateIndex {
             } else {
                 centroid_idx * (self.windows.len() - 1) / (centroid_count - 1)
             };
-            self.centroids.push(self.windows[window_idx].sketch.clone());
+            if let Some(sketch) = &self.windows[window_idx].sketch {
+                self.centroids.push(sketch.clone());
+            }
         }
         self.centroid_lists = (0..self.centroids.len()).map(|_| Vec::new()).collect();
         for (idx, window) in self.windows.iter().enumerate() {
-            let centroid_idx = nearest_centroid(&window.sketch, &self.centroids);
-            self.centroid_lists[centroid_idx].push(idx);
+            if let Some(sketch) = &window.sketch {
+                let centroid_idx = nearest_centroid(sketch, &self.centroids);
+                self.centroid_lists[centroid_idx].push(idx);
+            }
         }
     }
 
@@ -588,16 +466,19 @@ impl ExperimentalCandidateIndex {
                 .approximate_dot_prepared_query(&prepared_query)?;
             let target_end = window.target_start + self.config.window_len;
             let linear_start = self.target_offsets[window.target_id] + window.target_start;
-            push_top_hit(
+            push_top_indexed_hit(
                 &mut top,
                 top_k,
-                SearchHit {
-                    target_name: self.target_names[window.target_id].clone(),
-                    target_start: window.target_start,
-                    target_end,
-                    start: linear_start,
-                    end: linear_start + self.config.window_len,
-                    score,
+                IndexedSearchHit {
+                    target_id: window.target_id,
+                    hit: SearchHit {
+                        target_name: self.target_names[window.target_id].clone(),
+                        target_start: window.target_start,
+                        target_end,
+                        start: linear_start,
+                        end: linear_start + self.config.window_len,
+                        score,
+                    },
                 },
             );
         }
@@ -737,7 +618,12 @@ impl ExperimentalCandidateIndex {
         }
         let mut scored = ids
             .into_iter()
-            .map(|idx| (idx, dot_unchecked(sketch, &self.windows[idx].sketch)))
+            .filter_map(|idx| {
+                self.windows[idx]
+                    .sketch
+                    .as_deref()
+                    .map(|window_sketch| (idx, dot_unchecked(sketch, window_sketch)))
+            })
             .collect::<Vec<_>>();
         scored.sort_by(|left, right| right.1.total_cmp(&left.1));
         scored
@@ -785,401 +671,6 @@ fn validate_retrieval_options(options: RetrievalOptions) -> Result<(), String> {
         return Err("probes must be non-zero".to_owned());
     }
     Ok(())
-}
-
-const MINIMIZER_CACHE_MAGIC: &[u8; 8] = b"DQMINI3\n";
-
-fn load_minimizer_reference_cache(
-    path: &str,
-    reference_path: &str,
-    config: ReferenceIndexConfig,
-    retrieval: RetrievalOptions,
-) -> Result<Option<(ExperimentalCandidateIndex, usize)>, String> {
-    if retrieval.mode != RetrievalMode::Minimizer {
-        return Err("--reference-cache currently supports only --retrieval minimizer".to_owned());
-    }
-    let Ok(mut file) = File::open(path) else {
-        return Ok(None);
-    };
-    let mut magic = [0_u8; 8];
-    file.read_exact(&mut magic)
-        .map_err(|err| format!("failed to read reference cache magic {path}: {err}"))?;
-    if &magic != MINIMIZER_CACHE_MAGIC {
-        return Ok(None);
-    }
-    let cached_reference = read_string(&mut file)?;
-    let cached_config = read_index_config(&mut file)?;
-    let cached_retrieval = read_retrieval_options(&mut file)?;
-    let reference_bases = read_usize(&mut file)?;
-    if cached_reference != reference_path
-        || !index_config_matches(cached_config, config)
-        || cached_retrieval != retrieval
-    {
-        return Ok(None);
-    }
-    let target_count = read_usize(&mut file)?;
-    let mut target_names = Vec::with_capacity(target_count);
-    let mut target_offsets = Vec::with_capacity(target_count);
-    for _ in 0..target_count {
-        target_names.push(read_string(&mut file)?);
-        target_offsets.push(read_usize(&mut file)?);
-    }
-    let window_count = read_usize(&mut file)?;
-    let mut windows = Vec::with_capacity(window_count);
-    for _ in 0..window_count {
-        let target_id = read_u32(&mut file)? as usize;
-        if target_id >= target_names.len() {
-            return Err("reference cache window target id out of bounds".to_owned());
-        }
-        windows.push(CandidateWindow {
-            target_id,
-            target_start: read_u32(&mut file)? as usize,
-            sketch: Vec::new(),
-            quantized: read_cached_quantized_vector(&mut file, config)?,
-            simhash64: 0,
-            simhash128: [0, 0],
-        });
-    }
-    let posting_count = read_usize(&mut file)?;
-    let mut minimizer_postings = HashMap::with_capacity(posting_count);
-    for _ in 0..posting_count {
-        let hash = read_u64(&mut file)?;
-        let ids_len = read_u32(&mut file)? as usize;
-        let mut ids = Vec::with_capacity(ids_len);
-        for _ in 0..ids_len {
-            ids.push(read_u32(&mut file)? as usize);
-        }
-        minimizer_postings.insert(hash, ids);
-    }
-    Ok(Some((
-        ExperimentalCandidateIndex {
-            config,
-            retrieval,
-            target_names,
-            target_offsets,
-            windows,
-            minimizer_postings,
-            simhash_band_postings: Vec::new(),
-            mih_postings: Vec::new(),
-            centroids: Vec::new(),
-            centroid_lists: Vec::new(),
-            centroid_graph: Vec::new(),
-        },
-        reference_bases,
-    )))
-}
-
-fn save_minimizer_reference_cache(
-    path: &str,
-    reference_path: &str,
-    reference_bases: usize,
-    index: &ExperimentalCandidateIndex,
-) -> Result<(), String> {
-    if index.retrieval.mode != RetrievalMode::Minimizer {
-        return Ok(());
-    }
-    if let Some(parent) = std::path::Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create reference cache directory: {err}"))?;
-    }
-    let tmp = format!("{path}.tmp");
-    let mut file = File::create(&tmp)
-        .map_err(|err| format!("failed to create reference cache {tmp}: {err}"))?;
-    file.write_all(MINIMIZER_CACHE_MAGIC)
-        .map_err(|err| format!("failed to write reference cache magic {tmp}: {err}"))?;
-    write_string(&mut file, reference_path)?;
-    write_index_config(&mut file, index.config)?;
-    write_retrieval_options(&mut file, index.retrieval)?;
-    write_usize(&mut file, reference_bases)?;
-    write_usize(&mut file, index.target_names.len())?;
-    for (name, offset) in index.target_names.iter().zip(&index.target_offsets) {
-        write_string(&mut file, name)?;
-        write_usize(&mut file, *offset)?;
-    }
-    write_usize(&mut file, index.windows.len())?;
-    for window in &index.windows {
-        write_u32_from_usize(&mut file, window.target_id)?;
-        write_u32_from_usize(&mut file, window.target_start)?;
-        write_cached_quantized_vector(&mut file, &window.quantized, index.config)?;
-    }
-    write_usize(&mut file, index.minimizer_postings.len())?;
-    for (hash, ids) in &index.minimizer_postings {
-        write_u64(&mut file, *hash)?;
-        write_u32_from_usize(&mut file, ids.len())?;
-        for &id in ids {
-            write_u32_from_usize(&mut file, id)?;
-        }
-    }
-    file.flush()
-        .map_err(|err| format!("failed to flush reference cache {tmp}: {err}"))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|err| format!("failed to install reference cache {path}: {err}"))?;
-    Ok(())
-}
-
-fn index_config_matches(left: ReferenceIndexConfig, right: ReferenceIndexConfig) -> bool {
-    left.k == right.k
-        && left.dim == right.dim
-        && left.window_len == right.window_len
-        && left.stride == right.stride
-        && left.quantizer.bits == right.quantizer.bits
-        && left.quantizer.clip_sigma.to_bits() == right.quantizer.clip_sigma.to_bits()
-        && left.quantizer.rotation_seed == right.quantizer.rotation_seed
-        && left.quantizer.qjl_seed == right.quantizer.qjl_seed
-        && left.quantizer.use_qjl_residual == right.quantizer.use_qjl_residual
-}
-
-fn write_index_config(writer: &mut impl Write, config: ReferenceIndexConfig) -> Result<(), String> {
-    write_usize(writer, config.k)?;
-    write_usize(writer, config.dim)?;
-    write_usize(writer, config.window_len)?;
-    write_usize(writer, config.stride)?;
-    write_u8(writer, config.quantizer.bits)?;
-    write_f32(writer, config.quantizer.clip_sigma)?;
-    write_u64(writer, config.quantizer.rotation_seed)?;
-    write_u64(writer, config.quantizer.qjl_seed)?;
-    write_u8(writer, u8::from(config.quantizer.use_qjl_residual))
-}
-
-fn read_index_config(reader: &mut impl Read) -> Result<ReferenceIndexConfig, String> {
-    Ok(ReferenceIndexConfig {
-        k: read_usize(reader)?,
-        dim: read_usize(reader)?,
-        window_len: read_usize(reader)?,
-        stride: read_usize(reader)?,
-        quantizer: QuantizerConfig {
-            bits: read_u8(reader)?,
-            clip_sigma: read_f32(reader)?,
-            rotation_seed: read_u64(reader)?,
-            qjl_seed: read_u64(reader)?,
-            use_qjl_residual: read_u8(reader)? != 0,
-        },
-    })
-}
-
-fn write_retrieval_options(
-    writer: &mut impl Write,
-    retrieval: RetrievalOptions,
-) -> Result<(), String> {
-    write_u8(writer, retrieval_mode_code(retrieval.mode))?;
-    write_usize(writer, retrieval.candidate_limit)?;
-    write_usize(writer, retrieval.minimizer_k)?;
-    write_usize(writer, retrieval.minimizer_window)?;
-    write_usize(writer, retrieval.simhash_bands)?;
-    write_usize(writer, retrieval.centroids)?;
-    write_usize(writer, retrieval.probes)
-}
-
-fn read_retrieval_options(reader: &mut impl Read) -> Result<RetrievalOptions, String> {
-    Ok(RetrievalOptions {
-        mode: retrieval_mode_from_code(read_u8(reader)?)?,
-        candidate_limit: read_usize(reader)?,
-        minimizer_k: read_usize(reader)?,
-        minimizer_window: read_usize(reader)?,
-        simhash_bands: read_usize(reader)?,
-        centroids: read_usize(reader)?,
-        probes: read_usize(reader)?,
-    })
-}
-
-fn retrieval_mode_code(mode: RetrievalMode) -> u8 {
-    match mode {
-        RetrievalMode::Scan => 0,
-        RetrievalMode::Minimizer => 1,
-        RetrievalMode::Simhash => 2,
-        RetrievalMode::Mih => 3,
-        RetrievalMode::Ivf => 4,
-        RetrievalMode::Hnsw => 5,
-    }
-}
-
-fn retrieval_mode_from_code(code: u8) -> Result<RetrievalMode, String> {
-    match code {
-        0 => Ok(RetrievalMode::Scan),
-        1 => Ok(RetrievalMode::Minimizer),
-        2 => Ok(RetrievalMode::Simhash),
-        3 => Ok(RetrievalMode::Mih),
-        4 => Ok(RetrievalMode::Ivf),
-        5 => Ok(RetrievalMode::Hnsw),
-        _ => Err("unknown retrieval mode in reference cache".to_owned()),
-    }
-}
-
-fn write_cached_quantized_vector(
-    writer: &mut impl Write,
-    vector: &QuantizedVector,
-    config: ReferenceIndexConfig,
-) -> Result<(), String> {
-    let snapshot = vector.snapshot();
-    if snapshot.dim != config.dim
-        || snapshot.bits != config.quantizer.bits
-        || snapshot.codes_len != config.dim
-        || snapshot.codes_bits != config.quantizer.bits
-        || snapshot.rotation_seed != config.quantizer.rotation_seed
-    {
-        return Err("quantized vector does not match reference cache config".to_owned());
-    }
-    let expected_code_bytes = (config.dim * usize::from(config.quantizer.bits)).div_ceil(8);
-    if snapshot.codes_data.len() != expected_code_bytes {
-        return Err(
-            "quantized vector code byte length does not match reference cache config".to_owned(),
-        );
-    }
-    writer
-        .write_all(&snapshot.codes_data)
-        .map_err(|err| format!("failed to write reference cache quantized codes: {err}"))?;
-    if config.quantizer.use_qjl_residual {
-        match snapshot.qjl_residual {
-            Some(residual) => {
-                write_u8(writer, 1)?;
-                write_usize(writer, residual.signs.len())?;
-                for sign in residual.signs {
-                    write_u64(writer, sign)?;
-                }
-                write_f32(writer, residual.norm)?;
-            }
-            None => write_u8(writer, 0)?,
-        }
-    }
-    Ok(())
-}
-
-fn read_cached_quantized_vector(
-    reader: &mut impl Read,
-    config: ReferenceIndexConfig,
-) -> Result<QuantizedVector, String> {
-    let code_bytes = (config.dim * usize::from(config.quantizer.bits)).div_ceil(8);
-    let mut codes_data = vec![0_u8; code_bytes];
-    reader
-        .read_exact(&mut codes_data)
-        .map_err(|err| format!("failed to read reference cache quantized codes: {err}"))?;
-    let qjl_residual = if config.quantizer.use_qjl_residual {
-        if read_u8(reader)? == 0 {
-            None
-        } else {
-            let signs_len = read_usize(reader)?;
-            let mut signs = Vec::with_capacity(signs_len);
-            for _ in 0..signs_len {
-                signs.push(read_u64(reader)?);
-            }
-            Some(QjlResidualSnapshot {
-                signs,
-                dim: config.dim,
-                norm: read_f32(reader)?,
-                seed: config.quantizer.qjl_seed,
-            })
-        }
-    } else {
-        None
-    };
-    QuantizedVector::from_snapshot(QuantizedVectorSnapshot {
-        dim: config.dim,
-        bits: config.quantizer.bits,
-        clip: config.quantizer.clip_sigma / (config.dim as f32).sqrt(),
-        rotation_seed: config.quantizer.rotation_seed,
-        codes_data,
-        codes_len: config.dim,
-        codes_bits: config.quantizer.bits,
-        qjl_residual,
-    })
-}
-
-fn write_string(writer: &mut impl Write, value: &str) -> Result<(), String> {
-    write_bytes(writer, value.as_bytes())
-}
-
-fn read_string(reader: &mut impl Read) -> Result<String, String> {
-    String::from_utf8(read_bytes(reader)?)
-        .map_err(|err| format!("reference cache contained invalid UTF-8: {err}"))
-}
-
-fn write_bytes(writer: &mut impl Write, value: &[u8]) -> Result<(), String> {
-    write_usize(writer, value.len())?;
-    writer
-        .write_all(value)
-        .map_err(|err| format!("failed to write reference cache bytes: {err}"))
-}
-
-fn read_bytes(reader: &mut impl Read) -> Result<Vec<u8>, String> {
-    let len = read_usize(reader)?;
-    let mut value = vec![0_u8; len];
-    reader
-        .read_exact(&mut value)
-        .map_err(|err| format!("failed to read reference cache bytes: {err}"))?;
-    Ok(value)
-}
-
-fn write_usize(writer: &mut impl Write, value: usize) -> Result<(), String> {
-    write_u64(writer, value as u64)
-}
-
-fn read_usize(reader: &mut impl Read) -> Result<usize, String> {
-    usize::try_from(read_u64(reader)?)
-        .map_err(|_| "reference cache integer does not fit usize".to_owned())
-}
-
-fn write_u32_from_usize(writer: &mut impl Write, value: usize) -> Result<(), String> {
-    let value =
-        u32::try_from(value).map_err(|_| "reference cache integer does not fit u32".to_owned())?;
-    write_u32(writer, value)
-}
-
-fn write_u32(writer: &mut impl Write, value: u32) -> Result<(), String> {
-    writer
-        .write_all(&value.to_le_bytes())
-        .map_err(|err| format!("failed to write reference cache u32: {err}"))
-}
-
-fn read_u32(reader: &mut impl Read) -> Result<u32, String> {
-    let mut bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|err| format!("failed to read reference cache u32: {err}"))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn write_u64(writer: &mut impl Write, value: u64) -> Result<(), String> {
-    writer
-        .write_all(&value.to_le_bytes())
-        .map_err(|err| format!("failed to write reference cache u64: {err}"))
-}
-
-fn read_u64(reader: &mut impl Read) -> Result<u64, String> {
-    let mut bytes = [0_u8; 8];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|err| format!("failed to read reference cache u64: {err}"))?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn write_f32(writer: &mut impl Write, value: f32) -> Result<(), String> {
-    writer
-        .write_all(&value.to_le_bytes())
-        .map_err(|err| format!("failed to write reference cache f32: {err}"))
-}
-
-fn read_f32(reader: &mut impl Read) -> Result<f32, String> {
-    let mut bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|err| format!("failed to read reference cache f32: {err}"))?;
-    Ok(f32::from_le_bytes(bytes))
-}
-
-fn write_u8(writer: &mut impl Write, value: u8) -> Result<(), String> {
-    writer
-        .write_all(&[value])
-        .map_err(|err| format!("failed to write reference cache u8: {err}"))
-}
-
-fn read_u8(reader: &mut impl Read) -> Result<u8, String> {
-    let mut byte = [0_u8; 1];
-    reader
-        .read_exact(&mut byte)
-        .map_err(|err| format!("failed to read reference cache u8: {err}"))?;
-    Ok(byte[0])
 }
 
 #[derive(Clone, Debug)]
@@ -1306,11 +797,16 @@ fn run_sweep_fasta(args: Vec<String>) -> Result<(), String> {
 fn run_emit_candidates(args: Vec<String>) -> Result<(), String> {
     let options = parse_emit_args(&args)?;
     let config = build_index_config(options.bench)?;
+    let mut records = read_fasta_file(&options.reference_path)?;
+    truncate_records(&mut records, options.bench.max_bases);
+    let fingerprint = reference_fingerprint(&records);
+    let reference_bases = fingerprint.bases;
     if options.retrieval.mode != RetrievalMode::Scan
         && let Some(cache_path) = options.reference_cache.as_deref()
         && let Some((index, reference_bases)) = load_minimizer_reference_cache(
             cache_path,
             &options.reference_path,
+            fingerprint,
             config,
             options.retrieval,
         )?
@@ -1324,17 +820,11 @@ fn run_emit_candidates(args: Vec<String>) -> Result<(), String> {
         );
     }
 
-    let mut records = read_fasta_file(&options.reference_path)?;
-    truncate_records(&mut records, options.bench.max_bases);
-    let reference_bases = records
-        .iter()
-        .map(|record| record.bases.len())
-        .sum::<usize>();
     if options.retrieval.mode == RetrievalMode::Scan {
         return run_emit_candidates_scan(options, records, config, reference_bases);
     }
 
-    run_emit_candidates_indexed(options, records, config, reference_bases)
+    run_emit_candidates_indexed(options, records, fingerprint, config, reference_bases)
 }
 
 fn run_emit_candidates_scan(
@@ -1394,6 +884,7 @@ fn run_emit_candidates_scan(
 fn run_emit_candidates_indexed(
     options: EmitOptions,
     records: Vec<dino_quant::SequenceRecord>,
+    fingerprint: ReferenceFingerprint,
     config: ReferenceIndexConfig,
     reference_bases: usize,
 ) -> Result<(), String> {
@@ -1404,6 +895,7 @@ fn run_emit_candidates_indexed(
         save_minimizer_reference_cache(
             cache_path,
             &options.reference_path,
+            fingerprint,
             reference_bases,
             &index,
         )?;
@@ -1420,7 +912,7 @@ fn run_emit_candidates_with_index(
     cache_hit: bool,
 ) -> Result<(), String> {
     println!(
-        "query_name\tquery_len\trank\ttarget_name\ttarget_start\ttarget_end\tlinear_start\tlinear_end\tscore"
+        "query_name\tquery_len\trank\ttarget_name\ttarget_start\ttarget_end\tlinear_start\tlinear_end\tscore\ttarget_id"
     );
     let mut reads = 0_usize;
     let mut candidates = 0_usize;
@@ -1436,7 +928,7 @@ fn run_emit_candidates_with_index(
         for (rank, hit) in result.hits.iter().enumerate() {
             candidates += 1;
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}",
                 read_name,
                 record.bases.len(),
                 rank + 1,
@@ -1445,7 +937,8 @@ fn run_emit_candidates_with_index(
                 hit.target_end,
                 hit.start,
                 hit.end,
-                hit.score
+                hit.score,
+                hit.target_id
             );
         }
         Ok(())
@@ -1478,10 +971,12 @@ fn run_emit_candidate_reference(args: Vec<String>) -> Result<(), String> {
     let mut input_intervals = 0_usize;
     let mut merged_intervals = 0_usize;
 
-    for record in &records {
-        let Some(record_intervals) = intervals.get(&record.name) else {
+    for (record_idx, record) in records.iter().enumerate() {
+        let Some(record_intervals) = intervals.for_record(record_idx, &record.name) else {
             if options.mask_reference {
                 emit_masked_fasta_record(&record.name, &record.bases, &[]);
+                emitted_records += 1;
+                emitted_bases += record.bases.len();
             }
             continue;
         };
@@ -1513,15 +1008,16 @@ fn run_emit_candidate_reference(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn read_candidate_intervals(
-    path: &str,
-    padding: usize,
-) -> Result<HashMap<String, Vec<Interval>>, String> {
-    let input = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read candidate TSV {path}: {err}"))?;
-    let mut intervals: HashMap<String, Vec<Interval>> = HashMap::new();
-    for (line_idx, line) in input.lines().enumerate() {
+fn read_candidate_intervals(path: &str, padding: usize) -> Result<CandidateIntervals, String> {
+    let file =
+        File::open(path).map_err(|err| format!("failed to read candidate TSV {path}: {err}"))?;
+    let reader = BufReader::new(file);
+    let mut intervals = CandidateIntervals::default();
+    let mut target_id_col = None;
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line.map_err(|err| format!("failed to read candidate TSV line: {err}"))?;
         if line_idx == 0 && line.starts_with("query_name\t") {
+            target_id_col = line.split('\t').position(|field| field == "target_id");
             continue;
         }
         if line.trim().is_empty() {
@@ -1544,12 +1040,41 @@ fn read_candidate_intervals(
         if start >= end {
             continue;
         }
-        intervals.entry(target_name).or_default().push(Interval {
+        let interval = Interval {
             start: start.saturating_sub(padding),
             end: end.saturating_add(padding),
-        });
+        };
+        if let Some(col) = target_id_col
+            && let Some(value) = fields.get(col)
+            && !value.is_empty()
+        {
+            let target_id = value
+                .parse::<usize>()
+                .map_err(|err| format!("invalid target_id on line {}: {err}", line_idx + 1))?;
+            intervals.by_id.entry(target_id).or_default().push(interval);
+            continue;
+        }
+        intervals
+            .by_name
+            .entry(target_name)
+            .or_default()
+            .push(interval);
     }
     Ok(intervals)
+}
+
+#[derive(Default)]
+struct CandidateIntervals {
+    by_id: HashMap<usize, Vec<Interval>>,
+    by_name: HashMap<String, Vec<Interval>>,
+}
+
+impl CandidateIntervals {
+    fn for_record(&self, record_idx: usize, name: &str) -> Option<&Vec<Interval>> {
+        self.by_id
+            .get(&record_idx)
+            .or_else(|| self.by_name.get(name))
+    }
 }
 
 fn bound_interval(interval: Interval, len: usize) -> Option<Interval> {
@@ -2287,6 +1812,26 @@ fn push_top_hit(top: &mut Vec<SearchHit>, top_k: usize, hit: SearchHit) {
     }
 }
 
+fn push_top_indexed_hit(top: &mut Vec<IndexedSearchHit>, top_k: usize, hit: IndexedSearchHit) {
+    if top.len() < top_k {
+        top.push(hit);
+        return;
+    }
+
+    let mut worst_idx = 0;
+    let mut worst_score = top[0].score;
+    for (idx, current) in top.iter().enumerate().skip(1) {
+        if current.score < worst_score {
+            worst_idx = idx;
+            worst_score = current.score;
+        }
+    }
+
+    if hit.score > worst_score {
+        top[worst_idx] = hit;
+    }
+}
+
 #[cfg(test)]
 fn minimizer_hashes(seq: &[u8], k: usize, window: usize) -> Result<Vec<u64>, String> {
     let mut hashes = Vec::new();
@@ -2695,6 +2240,27 @@ mod tests {
 
         assert!(result.considered > 0);
         assert_eq!(result.hits.first().map(|hit| hit.target_start), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn minimizer_index_drops_raw_sketches_and_builds_postings() -> Result<(), String> {
+        let records = vec![dino_quant::SequenceRecord {
+            name: "ref".to_owned(),
+            bases: b"ACGTACGTGGGGTTTTAAAACCCC".to_vec(),
+        }];
+        let retrieval = RetrievalOptions {
+            mode: RetrievalMode::Minimizer,
+            candidate_limit: 16,
+            minimizer_k: 3,
+            minimizer_window: 2,
+            ..RetrievalOptions::default()
+        };
+        let index =
+            ExperimentalCandidateIndex::build_records(&records, test_config(8, 4), retrieval)?;
+
+        assert!(!index.minimizer_postings.is_empty());
+        assert!(index.windows.iter().all(|window| window.sketch.is_none()));
         Ok(())
     }
 
